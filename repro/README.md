@@ -1,12 +1,20 @@
-# UnexpectedNullRecordRepro
+# Minimal reproducer: "UNEXPECTED NULL RECORD" (Grizzly 5.0.3)
 
-Minimal reproducer for the "UNEXPECTED NULL RECORD" warning of
-org.glassfish.grizzly.http2.Http2SessionOutputSink.flushOutputQueue() (Grizzly 5.0.3,
-shipped e.g. in Payara 7.2026.10, see payara/Payara#8552).
+Reproduces the warning logged by `org.glassfish.grizzly.http2.Http2SessionOutputSink.flushOutputQueue()`
+when an HTTP/2 session is terminated while a record is pending in the session output queue
+(TaskQueue `spaceInBytes` vs. record-count desync). See payara/Payara#8552.
 
-## Run (JDK 21+)
+## Run (JDK 21+, Maven)
 
-    mvn dependency:copy -Dartifact=org.glassfish.grizzly:grizzly-http2:5.0.3 -DoutputDirectory=.
-    mvn dependency:copy -Dartifact=org.glassfish.grizzly:grizzly-framework:5.0.3 -DoutputDirectory=.
-    javac -cp grizzly-http2-5.0.3.jar:grizzly-framework-5.0.3.jar UnexpectedNullRecordRepro.java
-    java  -cp .:grizzly-http2-5.0.3.jar:grizzly-framework-5.0.3.jar UnexpectedNullRecordRepro
+    mvn -q compile exec:java
+
+Expected output:
+
+    WARNING: UNEXPECTED NULL RECORD. Queue-size: 45 byteToTransfer=0 queueSizeToFree=0 queueSize=45
+
+## Files
+
+- `Repro.java` — the whole reproducer (single file, ~55 lines). Drives the *real* private
+  `Http2SessionOutputSink.flushOutputQueue()` from `grizzly-http2:5.0.3`.
+- `pom.xml` — only dependency: `org.glassfish.grizzly:grizzly-http2:5.0.3` (pulls grizzly-framework etc. transitively).
+- `UnexpectedNullRecordRepro.java` — older, verbose two-part variant (kept for reference; not needed).
