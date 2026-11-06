@@ -169,8 +169,9 @@ public class Http2SessionOutputSink {
         }
 
         final Http2OutputQueueRecord record = new Http2OutputQueueRecord(stream.getId(), data, completionHandler, isLast);
-        outputQueue.offer(record);
-        outputQueue.reserveSpace(record.isZeroSizeData() ? 1 : dataSize);
+        if (outputQueue.offer(record)) {
+            outputQueue.reserveSpace(record.isZeroSizeData() ? 1 : dataSize);
+        }
 
         flushOutputQueue();
     }
@@ -205,10 +206,16 @@ public class Http2SessionOutputSink {
 
                 final Http2OutputQueueRecord record = outputQueue.poll();
                 if (record == null) {
-                    // keep this warning for now - should be reported when null record is spotted
-                    LOGGER.log(Level.WARNING, "UNEXPECTED NULL RECORD. Queue-size: {0} "
-                                    + "byteToTransfer={1} queueSizeToFree={2} queueSize={3}",
-                            new Object[]{outputQueue.size(), bytesToTransfer, queueSizeToFree, queueSize});
+                    if (outputQueue.isClosed()) {
+                        LOGGER.log(Level.FINE, "Output queue is closed. Queue-size: {0} "
+                                        + "byteToTransfer={1} queueSizeToFree={2} queueSize={3}",
+                                new Object[]{outputQueue.size(), bytesToTransfer, queueSizeToFree, queueSize});
+                    } else {
+                        // keep this warning for now - should be reported when null record is spotted
+                        LOGGER.log(Level.WARNING, "UNEXPECTED NULL RECORD. Queue-size: {0} "
+                                        + "byteToTransfer={1} queueSizeToFree={2} queueSize={3}",
+                                new Object[]{outputQueue.size(), bytesToTransfer, queueSizeToFree, queueSize});
+                    }
                     breakNow = true;
                     break;
                 }
