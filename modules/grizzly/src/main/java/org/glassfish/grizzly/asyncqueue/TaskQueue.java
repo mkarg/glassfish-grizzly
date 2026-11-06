@@ -72,7 +72,7 @@ public final class TaskQueue<E extends AsyncQueueRecord> {
      * @return the number of queued bytes.
      */
     public int size() {
-        return spaceInBytes;
+        return isClosed ? 0 : spaceInBytes;
     }
 
     /**
@@ -121,7 +121,11 @@ public final class TaskQueue<E extends AsyncQueueRecord> {
      * @return the new memory (in bytes) consumed by the queue.
      */
     public int reserveSpace(final int amount) {
-        return spaceInBytesUpdater.addAndGet(this, amount);
+        if (isClosed) {
+            return 0;
+        }
+        final int result = spaceInBytesUpdater.addAndGet(this, amount);
+        return isClosed ? 0 : result;
     }
 
     /**
@@ -131,7 +135,11 @@ public final class TaskQueue<E extends AsyncQueueRecord> {
      * @return the new memory (in bytes) consumed by the queue.
      */
     public int releaseSpace(final int amount) {
-        return spaceInBytesUpdater.addAndGet(this, -amount);
+        if (isClosed) {
+            return 0;
+        }
+        final int result = spaceInBytesUpdater.addAndGet(this, -amount);
+        return isClosed ? 0 : result;
     }
 
     /**
@@ -152,7 +160,7 @@ public final class TaskQueue<E extends AsyncQueueRecord> {
      * @return the number of queued bytes.
      */
     public int spaceInBytes() {
-        return spaceInBytes;
+        return isClosed ? 0 : spaceInBytes;
     }
 
     /**
@@ -274,16 +282,29 @@ public final class TaskQueue<E extends AsyncQueueRecord> {
      * Add the new task into the task queue.
      *
      * @param task new task.
+     * @return <tt>true</tt> if the task was queued, or <tt>false</tt> if the queue is already closed and the task
+     * was removed and failed instead.
      */
-    public void offer(final E task) {
+    public boolean offer(final E task) {
         queue.offer(task);
         if (isClosed && queue.remove(task)) {
             task.notifyFailure(new IOException("Connection closed"));
+            return false;
         }
+        return true;
     }
 
     public boolean isEmpty() {
-        return spaceInBytes == 0;
+        return size() == 0;
+    }
+
+    /**
+     * Returns <tt>true</tt> if the queue is closed.
+     *
+     * @return <tt>true</tt> if the queue is closed.
+     */
+    public boolean isClosed() {
+        return isClosed;
     }
 
     public void onClose() {
@@ -293,23 +314,17 @@ public final class TaskQueue<E extends AsyncQueueRecord> {
     public void onClose(final Throwable cause) {
         isClosed = true;
 
-        IOException error = null;
-        if (!isEmpty()) {
-            if (error == null) {
-                error = new IOException("Connection closed", cause);
-            }
+        final IOException error = new IOException("Connection closed", cause);
 
-            AsyncQueueRecord record;
-            while ((record = poll()) != null) {
-                record.notifyFailure(error);
-            }
+        AsyncQueueRecord record;
+        while ((record = poll()) != null) {
+            record.notifyFailure(error);
         }
+
+        spaceInBytesUpdater.set(this, 0);
 
         WriteHandler writeHandler;
         while ((writeHandler = pollWriteHandler()) != null) {
-            if (error == null) {
-                error = new IOException("Connection closed", cause);
-            }
             writeHandler.onError(error);
         }
     }
