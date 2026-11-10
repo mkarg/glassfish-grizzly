@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025 Contributors to the Eclipse Foundation.
+ * Copyright (c) 2025, 2026 Contributors to the Eclipse Foundation.
  * Copyright (c) 2012, 2020 Oracle and/or its affiliates and others.
  * All rights reserved.
  *
@@ -106,6 +106,9 @@ public class Http2Session {
     private volatile FilterChain htt2SessionChain;
 
     private final AtomicInteger concurrentStreamsCount = new AtomicInteger(0);
+    // streams which are still registered, but no longer count toward the local concurrent streams limit,
+    // see onSendEndOfStream(Http2Stream); guarded by sessionLock
+    private int closingStreamsCount;
 
     private final TreeMap<Integer, Http2Stream> streamsMap = new TreeMap<>();
 
@@ -570,41 +573,66 @@ public class Http2Session {
     /**
      * Terminate the HTTP2 session sending a GOAWAY frame using the specified error code and optional detail. Once the
      * GOAWAY frame is on the wire, the underlying TCP connection will be closed.
+     * <p>
+     * Filter subclasses may call this to end a misbehaving session with a specific error code, e.g.
+     * {@link ErrorCode#ENHANCE_YOUR_CALM} when a peer floods the server with frames. The method returns without waiting
+     * for the GOAWAY to be written and may be called from any thread. Only the first GOAWAY is sent: if the session is
+     * already going away (other than gracefully), the call has no effect.
      *
-     * @param errorCode an RFC 7540 error code.
-     * @param detail optional details.
+     * @param errorCode an RFC 9113 error code.
+     * @param detail optional details, sent as the GOAWAY frame's additional debug data; may be {@code null}.
      */
-    void terminate(final ErrorCode errorCode, final String detail) {
+    public void terminate(final ErrorCode errorCode, final String detail) {
         sendGoAwayAndClose(setGoAwayLocally(errorCode, detail, false));
     }
 
     private void sendGoAwayAndClose(final Http2Frame frame) {
-        if (frame != null) {
-            outputSink.writeDownStream(frame, new EmptyCompletionHandler<WriteResult>() {
-
-                private void close() {
-                    connection.closeSilently();
-                    outputSink.close();
-                }
-
-                @Override
-                public void failed(final Throwable throwable) {
-                    LOGGER.log(Level.WARNING, "Unable to write GOAWAY.  Terminating session.", throwable);
-                    close();
-                }
-
-                @Override
-                public void completed(final WriteResult result) {
-                    close();
-                }
-
-                @Override
-                public void cancelled() {
-                    LOGGER.log(Level.FINE, "GOAWAY write cancelled.  Terminating session.");
-                    close();
-                }
-            }, null);
+        if (frame == null) {
+            return;
         }
+
+        if (!connection.isOpen()) {
+            // The peer is already gone, so there's nobody left to receive the
+            // GOAWAY. Writing it would only fail with the IOException the
+            // connection was closed with, which is not a problem worth reporting.
+            LOGGER.log(Level.FINE, "Connection is already closed.  Skipping GOAWAY and terminating session.");
+            // writeDownStream() recycles the frame as part of serialization, this branch bypasses it.
+            frame.recycle();
+            closeConnectionAndOutputSink();
+            return;
+        }
+
+        outputSink.writeDownStream(frame, new EmptyCompletionHandler<WriteResult>() {
+
+            @Override
+            public void failed(final Throwable throwable) {
+                // The connection may have been closed by the peer in between the
+                // check above and the actual write, in which case the failure is
+                // expected and the reported cause is the connection's close reason.
+                if (!connection.isOpen()) {
+                    LOGGER.log(Level.FINE, "Connection has been closed while writing GOAWAY.  Terminating session.");
+                } else {
+                    LOGGER.log(Level.WARNING, "Unable to write GOAWAY.  Terminating session.", throwable);
+                }
+                closeConnectionAndOutputSink();
+            }
+
+            @Override
+            public void completed(final WriteResult result) {
+                closeConnectionAndOutputSink();
+            }
+
+            @Override
+            public void cancelled() {
+                LOGGER.log(Level.FINE, "GOAWAY write cancelled.  Terminating session.");
+                closeConnectionAndOutputSink();
+            }
+        }, null);
+    }
+
+    private void closeConnectionAndOutputSink() {
+        connection.closeSilently();
+        outputSink.close();
     }
 
     private GoAwayFrame setGoAwayLocally(final ErrorCode errorCode, final String detail, final boolean graceful) {
@@ -645,7 +673,7 @@ public class Http2Session {
             List<Http2Stream> closedStreams = new ArrayList<>(invalidStreams.values());
             for (final Http2Stream stream : closedStreams) {
                 stream.closedRemotely();
-                deregisterStream();
+                deregisterStream(stream);
             }
         }
     }
@@ -932,7 +960,7 @@ public class Http2Session {
 
     @SuppressWarnings("SameParameterValue")
     Http2Stream acceptStream(final HttpRequestPacket request, final int streamId, final int parentStreamId, final boolean exclusive, final int priority)
-            throws Http2SessionException {
+            throws Http2SessionException, Http2StreamException {
 
         final Http2Stream stream = newStream(request, streamId, parentStreamId, exclusive, priority);
 
@@ -941,11 +969,6 @@ public class Http2Session {
                 return null; // if the session is closed is set - return null to ignore stream creation
             }
 
-            if (concurrentStreamsCount.get() >= getLocalMaxConcurrentStreams()) {
-                // throw Session level exception because headers were not decompressed,
-                // so compression context is lost
-                throw new Http2SessionException(ErrorCode.REFUSED_STREAM);
-            }
             if (isServer()) {
                 if (streamId > 0 && (streamId & 1) == 0) {
                     throw new Http2SessionException(ErrorCode.PROTOCOL_ERROR);
@@ -958,6 +981,14 @@ public class Http2Session {
 
             if (streamId < lastPeerStreamId) {
                 throw new Http2SessionException(ErrorCode.PROTOCOL_ERROR);
+            }
+
+            if (concurrentStreamsCount.get() - closingStreamsCount >= getLocalMaxConcurrentStreams()) {
+                // RFC 9113, section 5.1.2: a stream over the advertised limit is a stream error, not a connection error.
+                // The caller still has to decode the stream's header block to keep the HPACK context in sync.
+                // The stream ID is used up, so frames still arriving for it are handled as for a closed stream.
+                lastPeerStreamId = streamId;
+                throw new Http2StreamException(streamId, ErrorCode.REFUSED_STREAM, "Maximum number of concurrent streams exceeded");
             }
 
             registerStream(streamId, stream);
@@ -990,7 +1021,7 @@ public class Http2Session {
                 throw new Http2StreamException(streamId, ErrorCode.REFUSED_STREAM, "Session is closed");
             }
 
-            if (concurrentStreamsCount.get() >= getLocalMaxConcurrentStreams()) {
+            if (concurrentStreamsCount.get() - closingStreamsCount >= getLocalMaxConcurrentStreams()) {
                 throw new Http2StreamException(streamId, ErrorCode.REFUSED_STREAM);
             }
 
@@ -1080,13 +1111,36 @@ public class Http2Session {
     }
 
     /**
+     * Called right before a frame with the END_STREAM flag is written for the stream. If the stream input is already
+     * closed, the peer considers the stream closed as soon as this frame arrives and may open another stream in its
+     * place right away. The stream is deregistered only after the write, so it stops counting toward the concurrent
+     * streams limit now, otherwise such a new stream could be refused although the peer respects the limit.
+     */
+    void onSendEndOfStream(final Http2Stream stream) {
+        if (!stream.inputBuffer.isClosed()) {
+            return;
+        }
+        synchronized (sessionLock) {
+            if (!stream.isClosing && !stream.isDeregistered) {
+                stream.isClosing = true;
+                closingStreamsCount++;
+            }
+        }
+    }
+
+    /**
      * Called from {@link Http2Stream} once stream is completely closed.
      */
-    void deregisterStream() {
+    void deregisterStream(final Http2Stream stream) {
         LOGGER.fine("deregisterStream()");
         final boolean isCloseSession;
         synchronized (sessionLock) {
             decStreamCount();
+            if (stream.isClosing) {
+                stream.isClosing = false;
+                closingStreamsCount--;
+            }
+            stream.isDeregistered = true;
             // If we're in GOAWAY state and there are no streams left - close this session
             isCloseSession = isGoingAway() && concurrentStreamsCount.get() <= 0;
             if (!isCloseSession) {

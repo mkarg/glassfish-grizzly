@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2026 Contributors to the Eclipse Foundation.
  * Copyright (c) 2010, 2020 Oracle and/or its affiliates. All rights reserved.
  * Copyright 2004 The Apache Software Foundation
  *
@@ -23,6 +24,8 @@ import java.io.UnsupportedEncodingException;
 import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
 import java.util.Arrays;
+
+import static org.glassfish.grizzly.http.util.HttpCodecUtils.isSpaceOrTab;
 
 /*
  * In a server it is very important to be able to operate on
@@ -903,7 +906,7 @@ public final class ByteChunk implements Chunk, Cloneable, Serializable {
             return false;
         }
 
-        if (b1 == b2) {
+        if (b1 == b2 && (b1 == null || b1Offs == b2Offs)) {
             return true;
         }
 
@@ -944,7 +947,7 @@ public final class ByteChunk implements Chunk, Cloneable, Serializable {
             return false;
         }
 
-        if (b1 == b2) {
+        if (b1 == b2 && (b1 == null || b1Offs == b2Offs)) {
             return true;
         }
 
@@ -952,12 +955,7 @@ public final class ByteChunk implements Chunk, Cloneable, Serializable {
             return false;
         }
 
-        for (int i = 0; i < b1Len; i++) {
-            if (Ascii.toLower(b1[i + b1Offs]) != Ascii.toLower(b2[i + b2Offs])) {
-                return false;
-            }
-        }
-        return true;
+        return Swar.equalsIgnoreCase(b1, b1Offs, b2, b2Offs, b1Len);
     }
 
     /**
@@ -997,13 +995,7 @@ public final class ByteChunk implements Chunk, Cloneable, Serializable {
             return false;
         }
 
-        for (int i = 0; i < len; i++) {
-            if (Ascii.toLower(buffer[i + start]) != cmpTo[i]) {
-                return false;
-            }
-        }
-
-        return true;
+        return Swar.equalsIgnoreCaseLowerCase(buffer, start, cmpTo, len);
     }
 
     public static boolean startsWith(final byte[] buffer, final int start, final int end, final byte[] cmpTo) {
@@ -1020,6 +1012,79 @@ public final class ByteChunk implements Chunk, Cloneable, Serializable {
         }
 
         return true;
+    }
+
+    /**
+     * Checks whether the specified byte range ends with the expected token and
+     * contains only non-empty delimiter-separated tokens, ignoring ASCII case.
+     *
+     * <p>Optional whitespace ({@code SP} or {@code HTAB}) before the final
+     * token and around preceding tokens are ignored when validating tokens.
+     * The expected token must either be the entire range or be preceded by the
+     * specified {@code delimiter}, optionally followed by {@code SP} or
+     * {@code HTAB}.</p>
+     *
+     * <p>Each token in the range must contain at least one non-whitespace byte.
+     *
+     * <p>The {@code cmpTo} must contain only lowercase ASCII characters.</p>
+     *
+     * @param buffer the byte array containing the value to inspect
+     * @param start the inclusive start index of the range to inspect
+     * @param end the exclusive end index of the range to inspect
+     * @param cmpTo the lowercase ASCII token expected at the end of the range
+     * @param delimiter the byte that separates tokens
+     * @return {@code true} if the range contains only non-empty delimited tokens
+     *         and ends with {@code cmpTo}; otherwise {@code false}
+     */
+    public static boolean endsWithValidDelimitedTokenIgnoreCaseLowerCase(final byte[] buffer, final int start,
+                                                                         final int end, final byte[] cmpTo,
+                                                                         final byte delimiter) {
+        final int compareLength = cmpTo.length;
+        final int tokenStart = end - compareLength;
+        if (compareLength == 0 || tokenStart < start) {
+            return false;
+        }
+
+        // Compare the final token.
+        for (int i = 0; i < compareLength; i++) {
+            if (Ascii.toLower(buffer[tokenStart + i]) != cmpTo[i]) {
+                return false;
+            }
+        }
+
+        int previous = tokenStart - 1;
+        // Ignore whitespace immediately before the final token.
+        while (previous >= start && isSpaceOrTab(buffer[previous])) {
+            previous--;
+        }
+
+        // The expected token is the entire value.
+        if (previous < start) {
+            return true;
+        }
+
+        // A token must be preceded by a delimiter.
+        if (buffer[previous] != delimiter) {
+            return false;
+        }
+
+        // Validate preceding tokens: each delimiter-separated value must be non-empty.
+        boolean hasTokenValue = false;
+        for (previous--; previous >= start; previous--) {
+            final byte value = buffer[previous];
+            if (isSpaceOrTab(value)) {
+                continue;
+            }
+            if (value == delimiter) {
+                if (!hasTokenValue) {
+                    return false;
+                }
+                hasTokenValue = false;
+            } else {
+                hasTokenValue = true;
+            }
+        }
+        return hasTokenValue;
     }
 
     private static int hashBytes(byte[] buff, int start, int bytesLen) {

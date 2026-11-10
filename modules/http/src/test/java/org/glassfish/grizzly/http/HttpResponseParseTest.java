@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2026 Contributors to the Eclipse Foundation.
  * Copyright (c) 2010, 2024 Oracle and/or its affiliates. All rights reserved.
  *
  * This program and the accompanying materials are made available under the
@@ -61,6 +62,7 @@ import static java.util.Arrays.asList;
 import static org.glassfish.grizzly.http.HttpCodecFilter.STRICT_HEADER_NAME_VALIDATION_RFC_9110;
 import static org.glassfish.grizzly.http.HttpCodecFilter.STRICT_HEADER_VALUE_VALIDATION_RFC_9110;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -71,8 +73,6 @@ import static org.junit.Assert.assertTrue;
 @RunWith(Parameterized.class)
 public class HttpResponseParseTest {
     private static final Logger logger = Grizzly.logger(HttpResponseParseTest.class);
-
-    public static final int PORT = 19021;
 
     private final boolean isStrictHeaderNameValidationSet;
     private final boolean isStrictHeaderValueValidationSet;
@@ -216,6 +216,29 @@ public class HttpResponseParseTest {
         }
     }
 
+    @Test
+    public void testExpectHeaderInResponse() {
+        // Expect is a request header; a response carrying it must still parse
+        final HttpPacket packet = doTestDecoder("HTTP/1.1 200 OK\r\nExpect: 100-continue\r\nContent-Length: 0\r\n\r\n", 4096);
+        final HttpHeader header = ((HttpContent) packet).getHttpHeader();
+        assertEquals("100-continue", header.getHeader("Expect"));
+    }
+
+    @Test
+    public void testExpectHeaderInResponseFromNonArrayBuffer() throws IOException {
+        // a composite buffer has no backing array: the header is parsed from the Buffer, not from a byte[]
+        final MemoryManager mm = MemoryManager.DEFAULT_MEMORY_MANAGER;
+        final Buffer input = Buffers.appendBuffers(mm, Buffers.wrap(mm, "HTTP/1.1 200 OK\r\nExp"),
+                Buffers.wrap(mm, "ect: 100-continue\r\nContent-Length: 0\r\n\r\n"));
+        assertFalse(input.hasArray());
+        final HttpClientFilter filter = new HttpClientFilter(4096);
+        final FilterChainContext ctx = FilterChainContext.create(new StandaloneConnection());
+        ctx.setMessage(input);
+        filter.handleRead(ctx);
+        final HttpHeader header = ((HttpContent) ctx.getMessage()).getHttpHeader();
+        assertEquals("100-continue", header.getHeader("Expect"));
+    }
+
     @SuppressWarnings({ "unchecked" })
     private HttpPacket doTestDecoder(String response, int limit) {
 
@@ -235,7 +258,7 @@ public class HttpResponseParseTest {
     }
 
     private void doHttpResponseTest(String protocol, int code, String phrase, Map<String, Pair<String, String>> headers, String eol) throws Exception {
-
+        final int port = TestUtils.findAvailableTcpPort();
         final FutureImpl<Boolean> parseResult = SafeFutureImpl.create();
 
         Connection<SocketAddress> connection = null;
@@ -251,10 +274,10 @@ public class HttpResponseParseTest {
         transport.setProcessor(filterChainBuilder.build());
 
         try {
-            transport.bind(PORT);
+            transport.bind(port);
             transport.start();
 
-            Future<Connection> future = transport.connect("localhost", PORT);
+            Future<Connection> future = transport.connect("localhost", port);
             connection = future.get(10, TimeUnit.SECONDS);
             assertTrue(connection != null);
 

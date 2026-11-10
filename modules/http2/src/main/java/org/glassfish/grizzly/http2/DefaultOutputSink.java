@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2026 Contributors to the Eclipse Foundation.
  * Copyright (c) 2012, 2020 Oracle and/or its affiliates. All rights reserved.
  *
  * This program and the accompanying materials are made available under the
@@ -103,12 +104,17 @@ class DefaultOutputSink implements StreamOutputSink {
 
     @Override
     public boolean canWrite() {
-        return outputQueue.size() < MAX_OUTPUT_QUEUE_SIZE;
+        return outputQueue.size() < MAX_OUTPUT_QUEUE_SIZE && http2Session.getOutputSink().canWrite();
     }
 
     @Override
     public void notifyWritePossible(final WriteHandler writeHandler) {
-        outputQueue.notifyWritePossible(writeHandler, MAX_OUTPUT_QUEUE_SIZE);
+        // data sent within the stream window goes straight to the session sink, so a backlog there has to block too
+        if (outputQueue.size() < MAX_OUTPUT_QUEUE_SIZE) {
+            http2Session.getOutputSink().notifyCanWrite(writeHandler);
+        } else {
+            outputQueue.notifyWritePossible(writeHandler, MAX_OUTPUT_QUEUE_SIZE);
+        }
     }
 
     private void assertReady() throws IOException {
@@ -512,6 +518,9 @@ class DefaultOutputSink implements StreamOutputSink {
             final MessageCloner<Buffer> messageCloner,
             final boolean sendFIN) {
 
+        if (sendFIN) {
+            http2Session.onSendEndOfStream(stream);
+        }
         http2Session.getOutputSink().writeDataDownStream(
             stream, headerFrames, data, completionHandler, messageCloner, sendFIN);
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025 Contributors to the Eclipse Foundation.
+ * Copyright (c) 2025, 2026 Contributors to the Eclipse Foundation.
  * Copyright (c) 2014, 2020 Oracle and/or its affiliates. All rights reserved.
  *
  * This program and the accompanying materials are made available under the
@@ -21,6 +21,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -28,10 +29,15 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Objects;
 import java.util.Set;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import java.util.stream.IntStream;
 import org.glassfish.grizzly.attributes.Attribute;
@@ -212,6 +218,242 @@ public class AttributesTest {
             assertEquals(attr.toString(), value, attr.remove(holder));
             assertNull(attr.toString(), attr.get(holder));
         }));
+    }
+
+    @Test
+    public void testConcurrentWritesWhileGrowing() throws Exception {
+        if (!isSafe) {
+            return;
+        }
+        for (int round = 0; round < 20; round++) {
+            final AttributeBuilder builder = new DefaultAttributeBuilder();
+            final AttributeHolder holder = builder.createSafeAttributeHolder();
+            final int threads = 8;
+            final int perThread = 64;
+            final Attribute[] attrs = new Attribute[threads * perThread];
+            IntStream.range(0, attrs.length).forEach(i -> attrs[i] = builder.createAttribute("attribute-" + i));
+
+            // thread t owns attributes t, t + threads, ...: interleaved indexes force concurrent resizes
+            final CyclicBarrier start = new CyclicBarrier(threads);
+            final Thread[] workers = new Thread[threads];
+            final AtomicReference<Throwable> failure = new AtomicReference<>();
+            for (int t = 0; t < threads; t++) {
+                final int id = t;
+                workers[t] = new Thread(() -> {
+                    try {
+                        start.await();
+                        for (int i = id; i < attrs.length; i += threads) {
+                            attrs[i].set(holder, "v" + i);
+                        }
+                    } catch (Throwable e) {
+                        failure.set(e);
+                    }
+                });
+                workers[t].start();
+            }
+            for (Thread w : workers) {
+                w.join();
+            }
+            assertNull(failure.get());
+            for (int i = 0; i < attrs.length; i++) {
+                assertEquals(attrs[i].toString(), "v" + i, attrs[i].get(holder));
+            }
+            assertEquals(attrs.length, holder.getAttributeNames().size());
+        }
+    }
+
+    @Test
+    public void testInitializerRunsOnceUnderContention() throws Exception {
+        if (!isSafe) {
+            return;
+        }
+        for (int round = 0; round < 10; round++) {
+            final AttributeBuilder builder = new DefaultAttributeBuilder();
+            final AtomicInteger created = new AtomicInteger();
+            final Attribute<Object> attr = builder.createAttribute("lazy", (Supplier<Object>) () -> {
+                created.incrementAndGet();
+                try {
+                    Thread.sleep(20); // keep the initializer running while the other threads miss too
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                return new Object();
+            });
+            final AttributeHolder holder = builder.createSafeAttributeHolder();
+
+            final int threads = 8;
+            final CyclicBarrier start = new CyclicBarrier(threads);
+            final Object[] seen = new Object[threads];
+            final AtomicReference<Throwable> failure = new AtomicReference<>();
+            final Thread[] workers = new Thread[threads];
+            for (int t = 0; t < threads; t++) {
+                final int id = t;
+                workers[t] = new Thread(() -> {
+                    try {
+                        start.await();
+                        seen[id] = attr.get(holder);
+                    } catch (Throwable e) {
+                        failure.set(e);
+                    }
+                });
+                workers[t].start();
+            }
+            for (Thread w : workers) {
+                w.join();
+            }
+            assertNull(failure.get());
+            assertEquals("initializer runs", 1, created.get());
+            for (Object o : seen) {
+                assertSame(seen[0], o);
+            }
+        }
+    }
+
+    @Test
+    public void testRemoveAndInitializeWhileGrowing() throws Exception {
+        if (!isSafe) {
+            return;
+        }
+        for (int round = 0; round < 20; round++) {
+            final AttributeBuilder builder = new DefaultAttributeBuilder();
+            final AttributeHolder holder = builder.createSafeAttributeHolder();
+            final int threads = 8;
+            final int perThread = 64;
+            final Attribute[] attrs = new Attribute[threads * perThread];
+            final AtomicInteger initialized = new AtomicInteger();
+            IntStream.range(0, attrs.length).forEach(i -> attrs[i] = i % 2 == 0 ? builder.createAttribute("attribute-" + i)
+                    : builder.createAttribute("lazy-" + i, (Supplier<Object>) () -> "init-" + initialized.incrementAndGet()));
+
+            // even indexes are set and removed, odd ones initialized by a get; interleaved, so the array grows meanwhile
+            final CyclicBarrier start = new CyclicBarrier(threads);
+            final AtomicReference<Throwable> failure = new AtomicReference<>();
+            final Thread[] workers = new Thread[threads];
+            for (int t = 0; t < threads; t++) {
+                final int id = t;
+                workers[t] = new Thread(() -> {
+                    try {
+                        start.await();
+                        for (int i = id; i < attrs.length; i += threads) {
+                            if (i % 2 == 0) {
+                                attrs[i].set(holder, "v" + i);
+                                attrs[i].remove(holder);
+                            } else {
+                                attrs[i].get(holder);
+                            }
+                        }
+                    } catch (Throwable e) {
+                        failure.set(e);
+                    }
+                });
+                workers[t].start();
+            }
+            for (Thread w : workers) {
+                w.join();
+            }
+            assertNull(failure.get());
+            for (int i = 0; i < attrs.length; i++) {
+                if (i % 2 == 0) {
+                    assertNull(attrs[i].toString(), attrs[i].peek(holder));
+                } else {
+                    assertNotNull(attrs[i].toString(), attrs[i].peek(holder));
+                }
+            }
+            assertEquals(attrs.length / 2, initialized.get());
+            assertEquals(attrs.length / 2, holder.getAttributeNames().size());
+        }
+    }
+
+    @Test
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    public void testHotSlotWritesSurviveGrowth() throws Exception {
+        if (!isSafe) {
+            return;
+        }
+        final int writers = 4;
+        for (int round = 0; round < 300; round++) {
+            final AttributeBuilder builder = new DefaultAttributeBuilder();
+            final Attribute[] hot = new Attribute[writers];
+            for (int w = 0; w < writers; w++) {
+                hot[w] = builder.createAttribute("hot-" + w);
+            }
+            final Attribute[] grow = new Attribute[4096];
+            for (int i = 0; i < grow.length; i++) {
+                grow[i] = builder.createAttribute("grow-" + i);
+            }
+            final AttributeHolder holder = builder.createSafeAttributeHolder();
+            final AtomicBoolean done = new AtomicBoolean();
+            final AtomicReference<Throwable> failure = new AtomicReference<>();
+            final CyclicBarrier start = new CyclicBarrier(writers + 1);
+            final Thread[] workers = new Thread[writers];
+            for (int w = 0; w < writers; w++) {
+                final Attribute mine = hot[w];
+                workers[w] = new Thread(() -> {
+                    try {
+                        start.await();
+                        Integer last = null;
+                        while (!done.get()) {
+                            final Object seen = mine.peek(holder);
+                            if (!Objects.equals(seen, last)) {
+                                failure.compareAndSet(null, new AssertionError(mine + ": lost update, expected " + last + " but was " + seen));
+                                return;
+                            }
+                            last = last == null ? 0 : last + 1;
+                            mine.set(holder, last);
+                        }
+                    } catch (Throwable e) {
+                        failure.compareAndSet(null, e);
+                    }
+                });
+                workers[w].start();
+            }
+            start.await();
+            for (int i = 0; i < grow.length; i++) {
+                grow[i].set(holder, "g" + i); // several resizes per round while the hot slots are written
+            }
+            done.set(true);
+            for (Thread t : workers) {
+                t.join();
+            }
+            assertNull(String.valueOf(failure.get()), failure.get());
+        }
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testReentrantAndThrowingInitializers() {
+        if (!isSafe) {
+            return;
+        }
+        final AttributeBuilder builder = new DefaultAttributeBuilder();
+        final AttributeHolder holder = builder.createSafeAttributeHolder();
+        for (int i = 0; i < 100; i++) {
+            builder.createAttribute("filler-" + i);
+        }
+        final Attribute<Object> far = builder.createAttribute("far"); // index 100
+        final Attribute<Object>[] self = new Attribute[1];
+        self[0] = builder.createAttribute("self", (Supplier<Object>) () -> {
+            far.set(holder, "far"); // grows the array while the initializer lock is held
+            self[0].set(holder, "inner"); // re-entrant write of the attribute being initialized
+            return "outer";
+        });
+        assertEquals("inner", self[0].get(holder));
+        assertEquals("inner", self[0].peek(holder));
+        assertEquals("far", far.peek(holder));
+
+        final AtomicInteger calls = new AtomicInteger();
+        final Attribute<Object> flaky = builder.createAttribute("flaky", (Supplier<Object>) () -> {
+            if (calls.incrementAndGet() == 1) {
+                throw new IllegalStateException("boom");
+            }
+            return "ok";
+        });
+        try {
+            flaky.get(holder);
+            fail();
+        } catch (IllegalStateException expected) {
+        }
+        assertNull(flaky.peek(holder));
+        assertEquals("ok", flaky.get(holder)); // the lock was released, the next get initializes
     }
 
     @Test

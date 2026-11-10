@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2026 Contributors to the Eclipse Foundation.
  * Copyright (c) 2010, 2020 Oracle and/or its affiliates. All rights reserved.
  * Copyright 2004 The Apache Software Foundation
  *
@@ -17,8 +18,10 @@
 
 package org.glassfish.grizzly.http.util;
 
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Iterator;
+import java.util.Locale;
 
 import org.glassfish.grizzly.Buffer;
 
@@ -104,7 +107,7 @@ public class MimeHeaders {
      */
     public static final int DEFAULT_HEADER_SIZE = 8;
 
-    public static DataChunk NOOP_CHUNK = new DataChunk.Immutable(null);
+    public static final DataChunk NOOP_CHUNK = new DataChunk.Immutable(null);
 
     /**
      * The header fields.
@@ -446,7 +449,7 @@ public class MimeHeaders {
      * Create a new named header using un-translated byte[]. The conversion to chars can be delayed until encoding is known.
      */
     public DataChunk addValue(final byte[] buffer, final int startN, final int len) {
-        if (!isValidName(buffer)) {
+        if (!isValidName(buffer, startN, len)) {
             return NOOP_CHUNK;
         }
         MimeHeaderField mhf = createHeader();
@@ -458,7 +461,7 @@ public class MimeHeaders {
      * Create a new named header using un-translated Buffer. The conversion to chars can be delayed until encoding is known.
      */
     public DataChunk addValue(final Buffer buffer, final int startN, final int len) {
-        if (!isValidName(buffer)) {
+        if (!isValidName(buffer, startN, len)) {
             return NOOP_CHUNK;
         }
         MimeHeaderField mhf = createHeader();
@@ -658,19 +661,21 @@ public class MimeHeaders {
     } // END MaxHeaderCountExceededException
 
     private boolean isValidName(final String name) {
-        return !marked || Arrays.binarySearch(INVALID_TRAILER_NAMES, name.toLowerCase()) < 0;
+        return !marked || Arrays.binarySearch(INVALID_TRAILER_NAMES, name.toLowerCase(Locale.ROOT)) < 0;
     }
 
     private boolean isValidName(final Header name) {
         return !marked || Arrays.binarySearch(INVALID_TRAILER_NAMES, name.getLowerCase()) < 0;
     }
 
-    private boolean isValidName(final byte[] name) {
-        return !marked || Arrays.binarySearch(INVALID_TRAILER_NAMES, new String(name).toLowerCase()) < 0;
+    private boolean isValidName(final byte[] buffer, final int start, final int len) {
+        return !marked
+                || Arrays.binarySearch(INVALID_TRAILER_NAMES, new String(buffer, start, len, StandardCharsets.ISO_8859_1).toLowerCase(Locale.ROOT)) < 0;
     }
 
-    private boolean isValidName(final Buffer name) {
-        return !marked || Arrays.binarySearch(INVALID_TRAILER_NAMES, name.toStringContent().toLowerCase()) < 0;
+    private boolean isValidName(final Buffer buffer, final int start, final int len) {
+        return !marked
+                || Arrays.binarySearch(INVALID_TRAILER_NAMES, buffer.toStringContent(StandardCharsets.ISO_8859_1, start, start + len).toLowerCase(Locale.ROOT)) < 0;
     }
 
 }

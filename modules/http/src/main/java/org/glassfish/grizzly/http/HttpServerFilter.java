@@ -24,6 +24,7 @@ import static org.glassfish.grizzly.http.util.HttpCodecUtils.skipSpaces;
 import static org.glassfish.grizzly.http.util.HttpCodecUtils.toCheckedByteArray;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 
@@ -44,6 +45,7 @@ import org.glassfish.grizzly.http.util.HttpDateFormat;
 import org.glassfish.grizzly.http.util.HttpStatus;
 import org.glassfish.grizzly.http.util.HttpUtils;
 import org.glassfish.grizzly.http.util.MimeHeaders;
+import org.glassfish.grizzly.http.util.Swar;
 import org.glassfish.grizzly.memory.MemoryManager;
 import org.glassfish.grizzly.utils.DelayedExecutor;
 
@@ -62,6 +64,9 @@ public class HttpServerFilter extends HttpCodecFilter {
     public static final String HTTP_SERVER_REQUEST_ATTR_NAME = HttpServerFilter.class.getName() + ".HttpRequest";
 
     public static final FilterChainEvent RESPONSE_COMPLETE_EVENT = new HttpEvents.ResponseCompleteEvent();
+
+    private static final String H2C = "h2c";
+    private static final String H2 = "h2";
 
     private final Attribute<ServerHttpRequestImpl> httpRequestInProcessAttr;
     private final Attribute<KeepAliveContext> keepAliveContextAttr;
@@ -151,8 +156,8 @@ public class HttpServerFilter extends HttpCodecFilter {
     @Deprecated
     public HttpServerFilter(boolean chunkingEnabled, int maxHeadersSize, String defaultResponseContentType, KeepAlive keepAlive, DelayedExecutor executor,
             int maxRequestHeaders, int maxResponseHeaders) {
-        this(chunkingEnabled, maxHeadersSize, defaultResponseContentType, keepAlive, executor, MimeHeaders.MAX_NUM_HEADERS_DEFAULT,
-             MimeHeaders.MAX_NUM_HEADERS_DEFAULT, null);
+        this(chunkingEnabled, maxHeadersSize, defaultResponseContentType, keepAlive, executor, maxRequestHeaders,
+             maxResponseHeaders, null);
     }
 
     /**
@@ -389,6 +394,11 @@ public class HttpServerFilter extends HttpCodecFilter {
         boolean found = false;
 
         while (offset < limit) {
+            // skip bytes that are neither delimiters nor '?' eight at a time
+            offset = Swar.indexOfUriDelimiter(input, offset, limit);
+            if (offset == limit) {
+                break;
+            }
             final byte b = input[offset];
             if (b == Constants.SP || b == Constants.HT) {
                 found = true;
@@ -515,7 +525,15 @@ public class HttpServerFilter extends HttpCodecFilter {
 
         boolean found = false;
 
+        final ByteBuffer words = wordView(input);
         while (offset < limit) {
+            if (words != null) {
+                // skip bytes that are neither delimiters nor '?' eight at a time
+                offset = Swar.indexOfUriDelimiter(words, offset, limit);
+                if (offset == limit) {
+                    break;
+                }
+            }
             final byte b = input.get(offset);
             if (b == Constants.SP || b == Constants.HT) {
                 found = true;
@@ -549,6 +567,23 @@ public class HttpServerFilter extends HttpCodecFilter {
 
         state.offset = offset;
         return found;
+    }
+
+    /**
+     * Serves an HTTP/2 cleartext upgrade request that no filter accepted as plain HTTP/1.1, as though the
+     * <code>Upgrade</code> header were absent (RFC 7540, section 3.2). Otherwise its transfer encoding stays ignored: the
+     * handler gets a chunked body still chunk-encoded, and the request content never ends.
+     */
+    @Override
+    protected void onIncomingUpgrade(final FilterChainContext ctx, final HttpHeader httpHeader) {
+        super.onIncomingUpgrade(ctx, httpHeader);
+
+        // Http2ServerFilter clears the flag for an upgrade it accepts, so a set flag means nobody did
+        final DataChunk upgradeDC = httpHeader.getUpgradeDC();
+        if (httpHeader.isIgnoreContentModifiers() && (upgradeDC.equalsIgnoreCase(H2C) || upgradeDC.equalsIgnoreCase(H2))) {
+            httpHeader.setIgnoreContentModifiers(false);
+            upgradeDC.recycle();
+        }
     }
 
     @Override
@@ -722,7 +757,9 @@ public class HttpServerFilter extends HttpCodecFilter {
         final ServerHttpRequestImpl request = (ServerHttpRequestImpl) httpHeader;
         final HttpResponsePacket response = request.getResponse();
 
-        sendBadRequestResponse(ctx, response);
+        // 431 - Request Header Fields Too Large (RFC 6585, section 5)
+        sendErrorResponse(ctx, response,
+                t instanceof HttpHeaderTooLargeException ? HttpStatus.REQUEST_HEADER_FIELDS_TOO_LARGE : HttpStatus.BAD_REQUEST_400);
     }
 
     @Override
@@ -730,7 +767,7 @@ public class HttpServerFilter extends HttpCodecFilter {
         final ServerHttpRequestImpl request = (ServerHttpRequestImpl) httpHeader;
         final HttpResponsePacket response = request.getResponse();
         if (!response.isCommitted()) {
-            sendBadRequestResponse(ctx, response);
+            sendErrorResponse(ctx, response, HttpStatus.BAD_REQUEST_400);
         }
         httpHeader.setContentBroken(true);
 
@@ -944,7 +981,7 @@ public class HttpServerFilter extends HttpCodecFilter {
         if (status == httpResponse.getHttpStatus() && httpResponse.isCustomReasonPhraseSet()) {
             final DataChunk customReasonPhrase = httpResponse.isHtmlEncodingCustomReasonPhrase() ? HttpUtils.filter(httpResponse.getReasonPhraseDC())
                     : HttpUtils.filterNonPrintableCharacters(httpResponse.getReasonPhraseDC());
-            output = put(memoryManager, output, httpResponse.getTempHeaderEncodingBuffer(), customReasonPhrase);
+            output = put(memoryManager, output, httpResponse.getTempHeaderEncodingBuffer(output), customReasonPhrase);
         } else {
             output = put(memoryManager, output, status.getReasonPhraseBytes());
         }
@@ -1083,10 +1120,13 @@ public class HttpServerFilter extends HttpCodecFilter {
         return isKeepAlive;
     }
 
-    private void sendBadRequestResponse(final FilterChainContext ctx, final HttpResponsePacket response) {
+    /**
+     * Commits the response as an error and closes the connection. A status already set to an error is kept,
+     * otherwise <code>fallbackStatus</code> is used.
+     */
+    private void sendErrorResponse(final FilterChainContext ctx, final HttpResponsePacket response, final HttpStatus fallbackStatus) {
         if (response.getHttpStatus().getStatusCode() < 400) {
-            // 400 - Bad request
-            HttpStatus.BAD_REQUEST_400.setValues(response);
+            fallbackStatus.setValues(response);
         }
         ensureSerializableProtocol(response.getRequest());
         commitAndCloseAsError(ctx, response);
@@ -1141,7 +1181,7 @@ public class HttpServerFilter extends HttpCodecFilter {
             }
         } else {
             response.setStatus(HttpStatus.EXPECTATION_FAILED_417);
-            sendBadRequestResponse(ctx, response);
+            sendErrorResponse(ctx, response, HttpStatus.BAD_REQUEST_400);
         }
     }
 
@@ -1200,17 +1240,25 @@ public class HttpServerFilter extends HttpCodecFilter {
 
     } // END KeepAliveResolver
 
-    private static final class ServerHttpRequestImpl extends HttpRequestPacket implements HttpPacketParsing {
+    private static final class ServerHttpRequestImpl extends HttpRequestPacket implements HttpPacketParsing, ThreadCache.OwnerAware {
 
         private static final ThreadCache.CachedTypeIndex<ServerHttpRequestImpl> CACHE_IDX = ThreadCache.obtainIndex(ServerHttpRequestImpl.class, 16);
 
         public static ServerHttpRequestImpl create() {
-            final ServerHttpRequestImpl httpRequestImpl = ThreadCache.takeFromCache(CACHE_IDX);
-            if (httpRequestImpl != null) {
-                return httpRequestImpl;
+            ServerHttpRequestImpl httpRequestImpl = ThreadCache.takeFromCache(CACHE_IDX);
+            if (httpRequestImpl == null) {
+                httpRequestImpl = new ServerHttpRequestImpl();
             }
+            // service() and the recycle usually run on a worker thread, not on this one: give it back to this thread
+            httpRequestImpl.cacheOwner = ThreadCache.currentOwner();
+            return httpRequestImpl;
+        }
 
-            return new ServerHttpRequestImpl();
+        private ThreadCache.Owner cacheOwner;
+
+        @Override
+        public void keepInRecyclingThreadCache() {
+            cacheOwner = null;
         }
 
         /**
@@ -1339,7 +1387,10 @@ public class HttpServerFilter extends HttpCodecFilter {
                 return;
             }
             reset();
-            ThreadCache.putToCache(CACHE_IDX, this);
+            final ThreadCache.Owner owner = cacheOwner;
+            // a retained packet must not keep its owner's returned objects alive
+            cacheOwner = null;
+            ThreadCache.putToOwnerCache(owner, CACHE_IDX, this);
         }
     }
 }

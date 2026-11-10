@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, 2024 Contributors to the Eclipse Foundation
+ * Copyright (c) 2022, 2026 Contributors to the Eclipse Foundation
  * Copyright (c) 2008, 2020 Oracle and/or its affiliates. All rights reserved.
  * Copyright 2004 The Apache Software Foundation
  *
@@ -122,6 +122,16 @@ public class HttpServletResponseImpl implements HttpServletResponse, Holders.Res
 
         outputStream.initialize();
 
+    }
+
+    /**
+     * Initializes this response and applies the default response character encoding of the given context, if any.
+     */
+    public void initialize(final Response response, final HttpServletRequestImpl servletRequest, final WebappContext context) throws IOException {
+        initialize(response, servletRequest);
+        if (context != null && context.getResponseCharacterEncoding() != null) {
+            setCharacterEncoding(context.getResponseCharacterEncoding());
+        }
     }
 
     /**
@@ -474,7 +484,7 @@ public class HttpServletResponseImpl implements HttpServletResponse, Holders.Res
         if (isCommitted()) {
             throw new IllegalStateException("Illegal attempt to redirect the response after it has been committed.");
         }
-        response.sendRedirect(location);
+        response.sendRedirect(location, sc, clearBuffer);
     }
 
     /**

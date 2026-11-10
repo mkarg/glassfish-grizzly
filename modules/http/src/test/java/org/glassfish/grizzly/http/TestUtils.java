@@ -15,6 +15,9 @@
  */
 package org.glassfish.grizzly.http;
 
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.ServerSocket;
 import java.time.Duration;
 import java.util.concurrent.Callable;
 
@@ -70,10 +73,10 @@ public class TestUtils {
      * Repeatedly attempts to execute the given action. If the action throws an exception or assertion error,
      * it pauses and retries until the timeout is reached.
      *
-     * @param action        the task to execute
-     * @param timeoutMillis the maximum time to wait in milliseconds
-     * @param sleepMillis   the pause duration between retries in milliseconds
-     * @param <T>           the type of the result
+     * @param action the task to execute
+     * @param timeout the maximum time to keep retrying
+     * @param sleep the duration to wait between attempts
+     * @param <T> the type of the result
      * @return the result of the action if it succeeds before the timeout
      * @throws Exception if the timeout is exceeded, the last thrown exception is rethrown
      */
@@ -94,5 +97,12 @@ public class TestUtils {
         }
 
         throw lastException;
+    }
+
+    public static int findAvailableTcpPort() throws IOException {
+        try (ServerSocket socket = new ServerSocket(
+                0, 0, InetAddress.getLoopbackAddress())) {
+            return socket.getLocalPort();
+        }
     }
 }

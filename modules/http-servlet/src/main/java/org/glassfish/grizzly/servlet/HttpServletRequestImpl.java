@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022 Contributors to the Eclipse Foundation
+ * Copyright (c) 2022, 2026 Contributors to the Eclipse Foundation
  * Copyright (c) 2008, 2020 Oracle and/or its affiliates. All rights reserved.
  * Copyright 2004 The Apache Software Foundation
  *
@@ -172,11 +172,8 @@ public class HttpServletRequestImpl implements HttpServletRequest, Holders.Reque
         this.servletResponse = servletResponse;
         inputStream.initialize();
         contextImpl = context;
-        if (context.getRequestCharacterEncoding() != null) {
-            request.setCharacterEncoding(context.getResponseCharacterEncoding());
-        }
-        if (context.getResponseCharacterEncoding() != null) {
-            servletResponse.setCharacterEncoding(context.getResponseCharacterEncoding());
+        if (context.getRequestCharacterEncoding() != null && request.getCharacterEncoding() == null) {
+            request.setCharacterEncoding(context.getRequestCharacterEncoding());
         }
     }
 
@@ -969,11 +966,11 @@ public class HttpServletRequestImpl implements HttpServletRequest, Holders.Reque
             return null;
         }
 
-        internalSession.setSessionTimeout(MILLISECONDS.convert(contextImpl.sessionTimeoutInSeconds, SECONDS));
-
         httpSession = new HttpSessionImpl(contextImpl, internalSession);
 
         if (httpSession.isNew()) {
+            // An existing session keeps the timeout the application may have set with setMaxInactiveInterval()
+            internalSession.setSessionTimeout(MILLISECONDS.convert(contextImpl.sessionTimeoutInSeconds, SECONDS));
             httpSession.notifyNew();
         }
 

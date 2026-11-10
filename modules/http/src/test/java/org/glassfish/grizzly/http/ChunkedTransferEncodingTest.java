@@ -21,6 +21,7 @@ import static java.lang.Boolean.FALSE;
 import static java.lang.Boolean.TRUE;
 import static java.util.Arrays.asList;
 import static java.util.concurrent.TimeUnit.SECONDS;
+import static org.glassfish.grizzly.http.ChunkedTransferEncoding.STRICT_CHUNKED_TRANSFER_CODING_LINE_TERMINATOR_RFC_9112;
 import static org.glassfish.grizzly.http.HttpCodecFilter.DEFAULT_MAX_HTTP_PACKET_HEADER_SIZE;
 import static org.glassfish.grizzly.http.util.MimeHeaders.MAX_NUM_HEADERS_UNBOUNDED;
 import static org.glassfish.grizzly.memory.Buffers.EMPTY_BUFFER;
@@ -39,7 +40,6 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Map.Entry;
-import java.util.Properties;
 import java.util.Queue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutionException;
@@ -96,7 +96,6 @@ public class ChunkedTransferEncodingTest {
 
     private final String eol;
     private final boolean isChunkWhenParsing;
-    private final boolean isStrictChunkedTransferCodingLineTerminator;
 
     private TCPNIOTransport transport;
     private Connection connection;
@@ -104,6 +103,7 @@ public class ChunkedTransferEncodingTest {
 
     final BlockingQueue<Future<Boolean>> resultQueue = new LinkedTransferQueue<>();
 
+    private final TestUtils.SystemPropertyToggle isStrictChunkedTransferCodingLineTerminator;
     private final TestUtils.SystemPropertyToggle strictHeaderNameValidation;
     private final TestUtils.SystemPropertyToggle strictHeaderValueValidation;
 
@@ -120,17 +120,18 @@ public class ChunkedTransferEncodingTest {
                                      {"\n", TRUE, TRUE, null, null}});
     }
 
-    public ChunkedTransferEncodingTest(String eol, boolean isChunkWhenParsing, boolean isStrictChunkedTransferCodingLineTerminator,
+    public ChunkedTransferEncodingTest(String eol, boolean isChunkWhenParsing, boolean isStrictChunkedTransferCodingLineTerminatorSet,
             Boolean isStrictHeaderNameValidationSet, Boolean isStrictHeaderValueValidationSet) {
         this.eol = eol;
         this.isChunkWhenParsing = isChunkWhenParsing;
-        this.isStrictChunkedTransferCodingLineTerminator = isStrictChunkedTransferCodingLineTerminator;
+        this.isStrictChunkedTransferCodingLineTerminator = new TestUtils.SystemPropertyToggle(STRICT_CHUNKED_TRANSFER_CODING_LINE_TERMINATOR_RFC_9112, isStrictChunkedTransferCodingLineTerminatorSet, true);
         this.strictHeaderNameValidation = new TestUtils.SystemPropertyToggle(STRICT_HEADER_NAME_VALIDATION_RFC_9110, isStrictHeaderNameValidationSet, true);
         this.strictHeaderValueValidation = new TestUtils.SystemPropertyToggle(STRICT_HEADER_VALUE_VALIDATION_RFC_9110, isStrictHeaderValueValidationSet, true);
     }
 
     @Before
     public void before() throws Exception {
+        isStrictChunkedTransferCodingLineTerminator.set();
         strictHeaderNameValidation.set();
         strictHeaderValueValidation.set();
 
@@ -141,15 +142,8 @@ public class ChunkedTransferEncodingTest {
         if (isChunkWhenParsing) {
             filterChainBuilder.add(new ChunkingFilter(2));
         }
-        final Properties props;
-        if (isStrictChunkedTransferCodingLineTerminator) {
-            props = new Properties();
-            props.setProperty(ChunkedTransferEncoding.STRICT_CHUNKED_TRANSFER_CODING_LINE_TERMINATOR_RFC_9112, "true");
-        } else {
-            props = null;
-        }
         HttpServerFilter httpServerFilter = new HttpServerFilter(true, DEFAULT_MAX_HTTP_PACKET_HEADER_SIZE, null, null, null,
-                MAX_NUM_HEADERS_UNBOUNDED, MAX_NUM_HEADERS_UNBOUNDED, props);
+                MAX_NUM_HEADERS_UNBOUNDED, MAX_NUM_HEADERS_UNBOUNDED, null);
         filterChainBuilder.add(httpServerFilter);
         httpRequestCheckFilter = new HTTPRequestCheckFilter(resultQueue);
         filterChainBuilder.add(httpRequestCheckFilter);
@@ -177,6 +171,7 @@ public class ChunkedTransferEncodingTest {
     public void after() throws Exception {
         strictHeaderNameValidation.unset();
         strictHeaderValueValidation.unset();
+        isStrictChunkedTransferCodingLineTerminator.unset();
 
         if (connection != null) {
             connection.closeSilently();
@@ -211,6 +206,24 @@ public class ChunkedTransferEncodingTest {
         headers.put("X-Content-length", new Pair<>("2345", "2345"));
 
         final int packetsNum = 5;
+
+        doHttpRequestTest(packetsNum, true, headers);
+
+        for (int i = 0; i < packetsNum; i++) {
+            Future<Boolean> result = resultQueue.poll(1000, SECONDS);
+            assertNotNull("Timeout for result#" + i, result);
+            assertTrue(result.get(10, SECONDS));
+        }
+    }
+
+    @Test
+    public void testForbiddenTrailerHeadersAreDropped() throws Exception {
+        Map<String, Pair<String, String>> headers = new HashMap<>();
+        headers.put("Host", new Pair<>("evil", null));
+        headers.put("Authorization", new Pair<>("Basic Zm9vOmJhcg==", null));
+        headers.put("X-Checksum", new Pair<>("abc", "abc"));
+
+        final int packetsNum = 3;
 
         doHttpRequestTest(packetsNum, true, headers);
 
@@ -358,7 +371,7 @@ public class ChunkedTransferEncodingTest {
         f.get(5, SECONDS);
 
         Future<Boolean> result;
-        if (!isStrictChunkedTransferCodingLineTerminator) {
+        if (!isStrictChunkedTransferCodingLineTerminator.isEnabled()) {
             // first msg
             result = resultQueue.poll(5, SECONDS);
             assertTrue(result.get(2, SECONDS));

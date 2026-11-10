@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2026 Contributors to the Eclipse Foundation.
  * Copyright (c) 2014, 2020 Oracle and/or its affiliates. All rights reserved.
  *
  * This program and the accompanying materials are made available under the
@@ -87,6 +88,28 @@ class DecoderUtils extends EncoderDecoderUtilsBase {
         } finally {
             request.setProtocol(Protocol.HTTP_2_0);
             request.getResponse().setProtocol(Protocol.HTTP_2_0);
+        }
+    }
+
+    /**
+     * Decodes the pending header block and discards the headers. HPACK decoding updates the dynamic table shared by
+     * all the streams of the session, so the header block of a refused stream still has to be decoded, otherwise the
+     * header blocks of the following streams are decoded against a wrong table.
+     *
+     * @param http2Session the {@link Http2Session} which received the header block
+     * @throws Http2SessionException if the header block cannot be decoded
+     */
+    static void skipHeaders(final Http2Session http2Session) throws Http2SessionException {
+        try {
+            http2Session.getHeadersDecoder().decode(new DecodingCallback() {
+
+                @Override
+                public void onDecoded(final CharSequence name, final CharSequence value) {
+                }
+
+            });
+        } catch (RuntimeException re) {
+            throw new Http2SessionException(ErrorCode.COMPRESSION_ERROR, re.getMessage());
         }
     }
 
@@ -223,18 +246,22 @@ class DecoderUtils extends EncoderDecoderUtilsBase {
             return;
         }
 
-        case "upgrade": {
-            httpHeader.getUpgradeDC().setString(value);
-            return;
-        }
-
         case "expect": {
-            ((Http2Request) httpHeader).requiresAcknowledgement(true);
+            // a request header; a response may still carry it
+            if (httpHeader.isRequest()) {
+                ((Http2Request) httpHeader).requiresAcknowledgement(true);
+            }
             return;
         }
 
-        case "connection": {
-            throw new HeaderDecodingException(ErrorCode.PROTOCOL_ERROR, ErrorType.STREAM, "Invalid use of connection header.");
+        // RFC 9113, section 8.2.2: connection-specific header fields must not be used in HTTP/2. A message that
+        // carries any of them has to be treated as malformed.
+        case "connection":
+        case "proxy-connection":
+        case "keep-alive":
+        case "transfer-encoding":
+        case "upgrade": {
+            throw new HeaderDecodingException(ErrorCode.PROTOCOL_ERROR, ErrorType.STREAM, "Connection-specific header field not allowed in HTTP/2: " + name);
         }
 
         case "te": {

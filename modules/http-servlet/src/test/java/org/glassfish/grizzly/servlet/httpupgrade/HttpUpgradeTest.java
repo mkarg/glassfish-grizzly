@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2026 Contributors to the Eclipse Foundation.
  * Copyright (c) 2013, 2020 Oracle and/or its affiliates. All rights reserved.
  *
  * This program and the accompanying materials are made available under the
@@ -83,6 +84,7 @@ public class HttpUpgradeTest extends TestCase {
             httpServer.start();
 
             s = new Socket("localhost", PORT);
+            s.setSoTimeout(10 * 1000);
             output = s.getOutputStream();
             try {
                 String reqStr = "POST " + contextRoot + upgradeServlet + " HTTP/1.1" + CRLF;
@@ -115,7 +117,8 @@ public class HttpUpgradeTest extends TestCase {
 
                 String line = new String(b, 0, len);
                 sb.append(line);
-                if (sb.indexOf("World") > 0) {
+                final String delimiterRemoved = sb.toString().replace("/", "");
+                if (delimiterRemoved.indexOf("World") > 0) {
                     break;
                 }
             } while (true);
@@ -174,14 +177,6 @@ public class HttpUpgradeTest extends TestCase {
                 ServletOutputStream output = wc.getOutputStream();
                 ReadListenerImpl readListener = new ReadListenerImpl(delimiter, input, output);
                 input.setReadListener(readListener);
-
-                int b;
-                while (input.isReady() && (b = input.read()) != -1) {
-                    System.out.print((char) b);
-                    output.write(b);
-                }
-                output.flush();
-
             } catch (Exception ex) {
                 throw new RuntimeException(ex);
             }

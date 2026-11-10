@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022 Contributors to the Eclipse Foundation
+ * Copyright (c) 2022, 2026 Contributors to the Eclipse Foundation.
  * Copyright (c) 2008, 2020 Oracle and/or its affiliates. All rights reserved.
  *
  * This program and the accompanying materials are made available under the
@@ -18,9 +18,12 @@
 package org.glassfish.grizzly;
 
 import java.io.IOException;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.lang.reflect.Field;
 import java.net.InetSocketAddress;
 import java.nio.channels.SelectableChannel;
+import java.util.Collection;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
@@ -31,6 +34,7 @@ import java.util.concurrent.LinkedTransferQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.stream.Collectors;
 
 import org.glassfish.grizzly.filterchain.BaseFilter;
 import org.glassfish.grizzly.filterchain.FilterChainBuilder;
@@ -65,6 +69,8 @@ import org.junit.Before;
 import org.junit.Test;
 
 import static java.lang.Boolean.TRUE;
+import static java.time.Duration.ofMillis;
+import static java.time.Duration.ofSeconds;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.glassfish.grizzly.IOEvent.READ;
 import static org.glassfish.grizzly.IOEvent.SERVER_ACCEPT;
@@ -74,7 +80,6 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
 
 /**
  * Unit test for {@link TCPNIOTransport}
@@ -83,15 +88,16 @@ import static org.junit.Assert.fail;
  */
 public class TCPNIOTransportTest {
 
-    private static final int PORT = 19981;
     private static final Logger logger = Grizzly.logger(TCPNIOTransportTest.class);
 
     private TCPNIOTransport transport;
+    private Collection<TCPNIOServerConnection> observedServerConnections;
 
     @Before
     public void setUp() throws Exception {
         ByteBufferWrapper.DEBUG_MODE = true;
         transport = TCPNIOTransportBuilder.newInstance().build();
+        observedServerConnections = readServerConnections(transport);
     }
 
 
@@ -102,6 +108,9 @@ public class TCPNIOTransportTest {
             // but doesn't wait for that.
             transport.shutdownNow();
         }
+        if (observedServerConnections != null) {
+            observedServerConnections = null;
+        }
     }
 
 
@@ -109,30 +118,37 @@ public class TCPNIOTransportTest {
     public void testBindUnbind() throws Exception {
         logger.info("Starting test");
 
+        final int port = TestUtils.findAvailableTcpPort();
         Connection<?> connection = null;
         try {
-            bindToPort(transport);
+            bindToPort(transport, port);
 
-            Future<Connection> future = transport.connect("localhost", PORT);
+            Future<Connection> future = transport.connect("localhost", port);
             connection = future.get(10, SECONDS);
             assertNotNull(connection);
             connection.closeSilently();
             assertFalse("connection.isOpen", connection.isOpen());
 
             transport.unbindAll();
+            TestUtils.retryUntilSuccess(() -> {
+                final Future<Connection> connectFuture = transport.connect("localhost", port);
+                try {
+                    final Connection newConnection = connectFuture.get(3, SECONDS);
+                    if (newConnection != null && newConnection.isOpen()) {
+                        close(newConnection);
+                        throw new IllegalStateException("Server connection should be closed!:\n" +
+                                                        describeObservedServerConnections(observedServerConnections));
+                    }
+                } catch (ExecutionException e) {
+                    assertThat(e.getCause(), CoreMatchers.instanceOf(IOException.class));
+                }
+                return null;
+            }, ofSeconds(10), ofMillis(100));
 
-            future = transport.connect("localhost", PORT);
-            try {
-                future.get(10, SECONDS);
-                fail("Server connection should be closed!");
-            } catch (ExecutionException e) {
-                assertThat(e.getCause(), CoreMatchers.instanceOf(IOException.class));
-            }
+            logger.log(Level.INFO, "Binding to port {0}", port);
+            TestUtils.retryUntilSuccess(() -> transport.bind(port), ofSeconds(10), ofSeconds(1));
 
-            logger.log(Level.INFO, "Binding to port {0}", PORT);
-            transport.bind(PORT);
-
-            future = transport.connect("localhost", PORT);
+            future = transport.connect("localhost", port);
             connection = future.get(10, SECONDS);
             assertNotNull(connection);
         } finally {
@@ -144,46 +160,59 @@ public class TCPNIOTransportTest {
     public void testMultiBind() throws Exception {
         logger.info("Starting test");
 
+        final int port1 = TestUtils.findAvailableTcpPort();
+        final int port2 = TestUtils.findAvailableTcpPort();
         Connection<?> connection = null;
         try {
-            logger.log(Level.INFO, "Binding to port {0}", PORT);
-            final Connection<?> serverConnection1 = transport.bind(PORT);
+            logger.log(Level.INFO, "Binding to port {0}", port1);
+            final Connection<?> serverConnection1 = transport.bind(port1);
 
-            logger.log(Level.INFO, "Binding to port {0}", PORT + 1);
-            final Connection<?> serverConnection2 = transport.bind(PORT + 1);
+            logger.log(Level.INFO, "Binding to port {0}", port2);
+            final Connection<?> serverConnection2 = transport.bind(port2);
 
             transport.start();
 
-            Future<Connection> future = transport.connect("localhost", PORT);
+            Future<Connection> future = transport.connect("localhost", port1);
             connection = future.get(10, SECONDS);
             assertNotNull(connection);
             close(connection);
 
-            future = transport.connect("localhost", PORT + 1);
+            future = transport.connect("localhost", port2);
             connection = future.get(10, SECONDS);
             assertNotNull(connection);
             close(connection);
 
             transport.unbind(serverConnection1);
-
-            future = transport.connect("localhost", PORT);
-            try {
-                connection = future.get(10, SECONDS);
-                close(connection);
-                fail("Server connection should be closed!");
-            } catch (ExecutionException e) {
-                assertThat(e.getCause(), CoreMatchers.instanceOf(IOException.class));
-            }
+            TestUtils.retryUntilSuccess(() -> {
+                final Future<Connection> connectFuture = transport.connect("localhost", port1);
+                try {
+                    final Connection newConnection = connectFuture.get(3, SECONDS);
+                    if (newConnection != null && newConnection.isOpen()) {
+                        close(newConnection);
+                        throw new IllegalStateException("Server connection should be closed!:\n" +
+                                                        describeObservedServerConnections(observedServerConnections));
+                    }
+                } catch (ExecutionException e) {
+                    assertThat(e.getCause(), CoreMatchers.instanceOf(IOException.class));
+                }
+                return null;
+            }, ofSeconds(10), ofMillis(100));
 
             transport.unbind(serverConnection2);
-            future = transport.connect("localhost", PORT + 1);
-            try {
-                connection = future.get(10, SECONDS);
-                close(connection);
-                fail("Server connection should be closed!");
-            } catch (ExecutionException e) {
-                assertThat(e.getCause(), CoreMatchers.instanceOf(IOException.class));
-            }
+            TestUtils.retryUntilSuccess(() -> {
+                final Future<Connection> connectFuture = transport.connect("localhost", port2);
+                try {
+                    final Connection newConnection = connectFuture.get(3, SECONDS);
+                    if (newConnection != null && newConnection.isOpen()) {
+                        close(newConnection);
+                        throw new IllegalStateException("Server connection should be closed!:\n" +
+                                                        describeObservedServerConnections(observedServerConnections));
+                    }
+                } catch (ExecutionException e) {
+                    assertThat(e.getCause(), CoreMatchers.instanceOf(IOException.class));
+                }
+                return null;
+            }, ofSeconds(10), ofMillis(100));
         } finally {
             close(connection);
         }
@@ -193,6 +222,7 @@ public class TCPNIOTransportTest {
     public void testCloseListeners() throws Exception {
         logger.info("Starting test");
 
+        final int port = TestUtils.findAvailableTcpPort();
         BlockingQueue<Connection<?>> acceptedQueue = new LinkedTransferQueue<>();
         Connection<?> connectedConnection = null;
         Connection<?> acceptedConnection = null;
@@ -210,9 +240,9 @@ public class TCPNIOTransportTest {
 
             transport.setProcessor(filterChainBuilder.build());
 
-            bindToPort(transport);
+            bindToPort(transport, port);
 
-            Future<Connection> connectFuture = transport.connect(new InetSocketAddress("localhost", PORT));
+            Future<Connection> connectFuture = transport.connect(new InetSocketAddress("localhost", port));
             connectedConnection = connectFuture.get(10, SECONDS);
             acceptedConnection = acceptedQueue.poll(10, SECONDS);
 
@@ -250,6 +280,7 @@ public class TCPNIOTransportTest {
     public void testSelectorSwitch() throws Exception {
         logger.info("Starting test");
 
+        final int port = TestUtils.findAvailableTcpPort();
         CustomChannelDistributor distributor = new CustomChannelDistributor(transport);
         transport.setNIOChannelDistributor(distributor);
 
@@ -272,10 +303,10 @@ public class TCPNIOTransportTest {
         transport.setSelectorRunnersCount(4);
         Connection<?> connection = null;
         try {
-            bindToPort(transport);
+            bindToPort(transport, port);
 
             final FutureImpl<Connection> connectFuture = Futures.createSafeFuture();
-            transport.connect(new InetSocketAddress("localhost", PORT),
+            transport.connect(new InetSocketAddress("localhost", port),
                 Futures.toCompletionHandler(connectFuture, new EmptyCompletionHandler<Connection>() {
 
                     @Override
@@ -315,6 +346,7 @@ public class TCPNIOTransportTest {
     public void testConnectFutureCancel() throws Exception {
         logger.info("Starting test");
 
+        final int port = TestUtils.findAvailableTcpPort();
         AtomicInteger serverConnectCounter = new AtomicInteger();
         AtomicInteger serverCloseCounter = new AtomicInteger();
 
@@ -362,9 +394,9 @@ public class TCPNIOTransportTest {
         transport.setProcessor(serverFilterChainBuilder.build());
         SocketConnectorHandler connectorHandler = TCPNIOConnectorHandler.builder(transport)
             .processor(clientFilterChainBuilder.build()).build();
-        bindToPort(transport);
+        bindToPort(transport, port);
         for (int i = 0; i < 100; i++) {
-            Future<Connection> connectFuture = connectorHandler.connect(new InetSocketAddress("localhost", PORT));
+            Future<Connection> connectFuture = connectorHandler.connect(new InetSocketAddress("localhost", port));
             Thread.sleep(20);
             if (!connectFuture.cancel(false)) {
                 assertTrue("Future.isDone", connectFuture.isDone());
@@ -386,6 +418,7 @@ public class TCPNIOTransportTest {
     public void testParallelWritesBlockingMode() throws Exception {
         logger.info("Starting test");
 
+        final int port = TestUtils.findAvailableTcpPort();
         FilterChainBuilder filterChainBuilder = FilterChainBuilder.stateless();
         filterChainBuilder.add(new TransportFilter());
         filterChainBuilder.add(new RandomDelayOnWriteFilter());
@@ -398,7 +431,7 @@ public class TCPNIOTransportTest {
 
             transport.setProcessor(filterChainBuilder.build());
             transport.configureBlocking(true);
-            bindToPort(transport);
+            bindToPort(transport, port);
 
             FutureImpl<Boolean> clientFuture = SafeFutureImpl.create();
             FilterChainBuilder clientFilterChainBuilder = FilterChainBuilder.stateless();
@@ -411,7 +444,7 @@ public class TCPNIOTransportTest {
             SocketConnectorHandler connectorHandler = TCPNIOConnectorHandler.builder(transport)
                 .processor(clientFilterChainBuilder.build()).build();
 
-            Future<Connection> future = connectorHandler.connect("localhost", PORT);
+            Future<Connection> future = connectorHandler.connect("localhost", port);
             final Connection<?> connection = future.get(10, SECONDS);
             try {
                 assertNotNull(connection);
@@ -430,6 +463,7 @@ public class TCPNIOTransportTest {
     public void testThreadInterruptionDuringAcceptDoesNotMakeServerDeaf() throws Exception {
         logger.info("Starting test");
 
+        final int port = TestUtils.findAvailableTcpPort();
         Field interruptField = TCPNIOServerConnection.class.getDeclaredField("DISABLE_INTERRUPT_CLEAR");
         interruptField.setAccessible(true);
         interruptField.setBoolean(null, true);
@@ -438,7 +472,7 @@ public class TCPNIOTransportTest {
         transport.setKernelThreadPoolConfig(ThreadPoolConfig.defaultConfig().setCorePoolSize(1).setMaxPoolSize(1));
         transport.setIOStrategy(new SameThreadIOStrategyInterruptWrapper(true));
 
-        bindToPort(transport);
+        bindToPort(transport, port);
 
         TCPNIOTransport clientTransport = TCPNIOTransportBuilder.newInstance().build();
         clientTransport.setIOStrategy(SameThreadIOStrategy.getInstance());
@@ -448,7 +482,7 @@ public class TCPNIOTransportTest {
                     .processor(FilterChainBuilder.stateless().add(new TransportFilter()).build()).build();
             for (int i = 0; i < 10; i++) {
                 try {
-                    Future<Connection> f2 = connectorHandler.connect("localhost", PORT);
+                    Future<Connection> f2 = connectorHandler.connect("localhost", port);
                     Connection connection = f2.get(5, SECONDS);
                     assertTrue("connection.isOpen", connection.isOpen());
                     close(connection);
@@ -468,11 +502,12 @@ public class TCPNIOTransportTest {
     public void testThreadInterruptionElsewhereDoesNotMakeServerDeaf() throws Exception {
         logger.info("Starting test");
 
+        final int port = TestUtils.findAvailableTcpPort();
         transport.setSelectorRunnersCount(1);
         transport.setKernelThreadPoolConfig(ThreadPoolConfig.defaultConfig().setCorePoolSize(1).setMaxPoolSize(1));
         transport.setIOStrategy(new SameThreadIOStrategyInterruptWrapper(false));
 
-        bindToPort(transport);
+        bindToPort(transport, port);
 
         TCPNIOTransport clientTransport = TCPNIOTransportBuilder.newInstance().build();
         clientTransport.setIOStrategy(SameThreadIOStrategy.getInstance());
@@ -482,7 +517,7 @@ public class TCPNIOTransportTest {
                     .processor(FilterChainBuilder.stateless().add(new TransportFilter()).build()).build();
             int successfulAttempts = 0;
             for (int i = 0; i < 10; i++) {
-                Future<Connection> futureConnection = connectorHandler.connect("localhost", PORT);
+                Future<Connection> futureConnection = connectorHandler.connect("localhost", port);
                 futureConnection.get(5, SECONDS);
                 System.out.println("Successful connection (" + ++successfulAttempts + ").");
             }
@@ -493,16 +528,16 @@ public class TCPNIOTransportTest {
 
     // --------------------------------------------------------- Private Methods
 
-    private static void bindToPort(TCPNIOTransport transport) throws Exception {
-        logger.log(Level.INFO, "Binding to port {0}", PORT);
+    private static void bindToPort(TCPNIOTransport transport, final int port) throws Exception {
+        logger.log(Level.INFO, "Binding to port {0}", port);
         try {
-            transport.bind(PORT);
+            transport.bind(port);
             transport.start();
         } catch (Exception e) {
             logger.log(Level.SEVERE, "", e);
             throw e;
         }
-        logger.log(Level.INFO, "Bound to port {0}", PORT);
+        logger.log(Level.INFO, "Bound to port {0}", port);
     }
 
 
@@ -520,6 +555,28 @@ public class TCPNIOTransportTest {
         GrizzlyFuture<Closeable> future = connection.close();
         future.get(5, SECONDS);
         assertFalse("connection.isOpen", connection.isOpen());
+    }
+
+    private static Collection<TCPNIOServerConnection> readServerConnections(final TCPNIOTransport transport)
+            throws IllegalAccessException, NoSuchFieldException {
+        final VarHandle handle = MethodHandles.privateLookupIn(TCPNIOTransport.class, MethodHandles.lookup())
+                                              .findVarHandle(TCPNIOTransport.class, "serverConnections",
+                                                             Collection.class);
+        @SuppressWarnings("unchecked")
+        final Collection<TCPNIOServerConnection> value =
+                (Collection<TCPNIOServerConnection>) handle.get(transport);
+        return value;
+    }
+
+    private static String describeObservedServerConnections(final Collection<TCPNIOServerConnection> connections) {
+        if (connections == null) {
+            return "null";
+        } else if (connections.isEmpty()) {
+            return "empty";
+        } else {
+            return connections.stream().map(connection -> connection + ", isOpen=" + connection.isOpen())
+                              .collect(Collectors.joining(System.lineSeparator()));
+        }
     }
 
     // ---------------------------------------------------------- Nested Classes

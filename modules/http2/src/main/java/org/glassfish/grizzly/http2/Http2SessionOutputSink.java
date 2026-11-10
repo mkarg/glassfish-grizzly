@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2026 Contributors to the Eclipse Foundation.
  * Copyright (c) 2014, 2020 Oracle and/or its affiliates and others.
  * All rights reserved.
  *
@@ -30,6 +31,7 @@ import java.util.logging.Logger;
 
 import org.glassfish.grizzly.Buffer;
 import org.glassfish.grizzly.CompletionHandler;
+import org.glassfish.grizzly.Connection;
 import org.glassfish.grizzly.Grizzly;
 import org.glassfish.grizzly.WriteHandler;
 import org.glassfish.grizzly.WriteResult;
@@ -64,6 +66,8 @@ public class Http2SessionOutputSink {
     private final AtomicInteger availConnectionWindowSize;
     private final List<Http2Frame> tmpFramesList = new LinkedList<>();
     private final AtomicBoolean writerLock = new AtomicBoolean();
+    // set while a WriteHandler waits on the connection to resume flushOutputQueue()
+    private final AtomicBoolean connectionWritePending = new AtomicBoolean();
 
     public Http2SessionOutputSink(Http2Session session) {
         this.http2Session = session;
@@ -157,6 +161,33 @@ public class Http2SessionOutputSink {
             writeDownStream(msg, completionHandler, messageCloner);
             return;
         } else if (headerFrames != null && !headerFrames.isEmpty()) {
+            // Fast path: nothing is queued ahead of this data and the connection window covers it, so send the
+            // HEADERS and the DATA frame in one write instead of two. Headers still leave right now from this thread,
+            // which keeps the compression state consistent; if another thread is flushing, take the regular path.
+            final int size = data.remaining();
+            if (size <= MAX_FRAME_PAYLOAD_SIZE && stream.getUnflushedWritesCount() == 1 && outputQueue.isEmpty()
+                    && writerLock.compareAndSet(false, true)) {
+                boolean written = false;
+                try {
+                    if (outputQueue.isEmpty() && availConnectionWindowSize.get() >= size && connectionCanWrite()) {
+                        final Buffer payload = messageCloner != null ? messageCloner.clone(http2Session.getConnection(), data) : data;
+                        headerFrames.add(DataFrame.builder().streamId(stream.getId()).data(payload).endStream(isLast).build());
+                        availConnectionWindowSize.addAndGet(-size);
+                        written = true;
+                        writeDownStream(headerFrames, completionHandler, null);
+                    }
+                } finally {
+                    writerLock.set(false);
+                }
+                if (written) {
+                    // data queued meanwhile, e.g. by the completion handler of this write, found the writer locked
+                    if (!outputQueue.isEmpty()) {
+                        flushOutputQueue();
+                    }
+                    return;
+                }
+            }
+
             // flush the headers now in this thread,
             // because we have to keep compression state consistent
             writeDownStream(headerFrames);
@@ -187,7 +218,12 @@ public class Http2SessionOutputSink {
 
         // relaxed check if we have free window space and output queue is not empty
         // if yes - lock the writer (only one thread can flush)
-        while (availConnectionWindowSize.get() > 0 && !outputQueue.isEmpty() && writerLock.compareAndSet(false, true)) {
+        while (availConnectionWindowSize.get() > 0 && !outputQueue.isEmpty() && connectionCanWrite()
+                && writerLock.compareAndSet(false, true)) {
+
+            // hand at most one async write queue's worth of frames to the connection at a time
+            final int maxPendingBytes = http2Session.getConnection().getMaxAsyncWriteQueueSize();
+            final int maxBytesToTransfer = maxPendingBytes > 0 ? maxPendingBytes : Integer.MAX_VALUE;
 
             // get the values after the writer is locked
             availWindowSize = availConnectionWindowSize.get();
@@ -201,7 +237,7 @@ public class Http2SessionOutputSink {
             boolean breakNow = false;
 
             // gather all available output data frames
-            while (availWindowSize > bytesToTransfer && queueSize > queueSizeToFree) {
+            while (availWindowSize > bytesToTransfer && queueSize > queueSizeToFree && maxBytesToTransfer > queueSizeToFree) {
 
                 final Http2OutputQueueRecord record = outputQueue.poll();
                 if (record == null) {
@@ -276,6 +312,32 @@ public class Http2SessionOutputSink {
         if (needToNotifyQueueManagement) {
             outputQueue.doNotify();
         }
+    }
+
+    /**
+     * Checks whether the connection's async write queue accepts more data. If not, flushOutputQueue() is resumed
+     * once it does, so the frames wait in this sink instead of piling up in the connection's write queue.
+     */
+    private boolean connectionCanWrite() {
+        final Connection<?> connection = http2Session.getConnection();
+        if (connection.canWrite()) {
+            return true;
+        }
+        if (connectionWritePending.compareAndSet(false, true)) {
+            connection.notifyCanWrite(new WriteHandler() {
+                @Override
+                public void onWritePossible() {
+                    connectionWritePending.set(false);
+                    flushOutputQueue();
+                }
+
+                @Override
+                public void onError(final Throwable t) {
+                    connectionWritePending.set(false);
+                }
+            });
+        }
+        return false;
     }
 
     public void close() {

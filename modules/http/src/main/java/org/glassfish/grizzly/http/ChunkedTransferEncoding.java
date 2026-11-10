@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025 Contributors to the Eclipse Foundation.
+ * Copyright (c) 2025, 2026 Contributors to the Eclipse Foundation.
  * Copyright (c) 2010, 2024 Oracle and/or its affiliates. All rights reserved.
  *
  * This program and the accompanying materials are made available under the
@@ -67,7 +67,7 @@ public final class ChunkedTransferEncoding implements TransferEncoding {
         this.strictLineTerminator = Boolean.parseBoolean(Objects.requireNonNullElse(props, System.getProperties())
                                                                 .getProperty(
                                                                         STRICT_CHUNKED_TRANSFER_CODING_LINE_TERMINATOR_RFC_9112,
-                                                                        "false"));
+                                                                        "true"));
     }
 
     /**
@@ -383,7 +383,7 @@ public final class ChunkedTransferEncoding implements TransferEncoding {
                 final HttpTrailer httpTrailer = (HttpTrailer) httpContent;
                 final MimeHeaders mimeHeaders = httpTrailer.getHeaders();
                 httpChunkTrailer = HttpCodecFilter.encodeMimeHeaders(memoryManager, httpChunkTrailer, mimeHeaders,
-                        httpContent.getHttpHeader().getTempHeaderEncodingBuffer());
+                        httpContent.getHttpHeader().getTempHeaderEncodingBuffer(httpChunkTrailer));
             }
 
         }

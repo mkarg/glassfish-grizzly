@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2026 Contributors to the Eclipse Foundation.
  * Copyright (c) 2008, 2020 Oracle and/or its affiliates. All rights reserved.
  *
  * This program and the accompanying materials are made available under the
@@ -50,13 +51,7 @@ public final class Attribute<T> {
     }
 
     protected Attribute(final AttributeBuilder builder, final String name, final int index, final T defaultValue) {
-        this(builder, name, index, new Supplier<T>() {
-
-            @Override
-            public T get() {
-                return defaultValue;
-            }
-        });
+        this(builder, name, index, defaultValue == null ? null : () -> defaultValue);
     }
 
     protected Attribute(final AttributeBuilder builder, final String name, final int index, final Supplier<T> initializer) {

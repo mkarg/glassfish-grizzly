@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2026 Contributors to the Eclipse Foundation.
  * Copyright (c) 2008, 2020 Oracle and/or its affiliates. All rights reserved.
  *
  * This program and the accompanying materials are made available under the
@@ -20,15 +21,19 @@ import static jakarta.servlet.DispatcherType.REQUEST;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import org.glassfish.grizzly.Grizzly;
 import org.glassfish.grizzly.http.Note;
 import org.glassfish.grizzly.http.server.AfterServiceListener;
+import org.glassfish.grizzly.http.server.FormPostTooLargeException;
 import org.glassfish.grizzly.http.server.HttpHandler;
 import org.glassfish.grizzly.http.server.Request;
 import org.glassfish.grizzly.http.server.Response;
@@ -165,7 +170,7 @@ public class ServletHandler extends HttpHandler {
 
             setPathData(request, servletRequest);
             servletRequest.initialize(request, servletResponse, servletCtx);
-            servletResponse.initialize(response, servletRequest);
+            servletResponse.initialize(response, servletRequest, servletCtx);
 
             request.setNote(SERVLET_REQUEST_NOTE, servletRequest);
             request.setNote(SERVLET_RESPONSE_NOTE, servletResponse);
@@ -201,9 +206,28 @@ public class ServletHandler extends HttpHandler {
             // Request may want to initialize async processing
             servletRequest.onAfterService();
         } catch (Throwable ex) {
-            LOGGER.log(Level.SEVERE, "service exception:", ex);
-            customizeErrorPage(response, "Internal Error", 500, ex);
+            if (isFormPostTooLarge(ex)) {
+                customizeErrorPage(response, "Request Entity Too Large", 413, ex);
+            } else {
+                LOGGER.log(Level.SEVERE, "service exception:", ex);
+                customizeErrorPage(response, "Internal Error", 500, ex);
+            }
         }
+    }
+
+    /**
+     * Tells whether the given throwable or one of its causes is a {@link FormPostTooLargeException}. The exception is
+     * wrapped (for example into a {@link jakarta.servlet.ServletException}) while it travels up the filter chain, so the
+     * whole cause chain has to be inspected. A cyclic cause chain ends the walk once a throwable repeats.
+     */
+    static boolean isFormPostTooLarge(final Throwable throwable) {
+        final Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (Throwable current = throwable; current != null && seen.add(current); current = current.getCause()) {
+            if (current instanceof FormPostTooLargeException) {
+                return true;
+            }
+        }
+        return false;
     }
 
     protected FilterChainInvoker getFilterChain(Request request) {

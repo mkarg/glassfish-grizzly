@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022 Contributors to the Eclipse Foundation
+ * Copyright (c) 2022, 2026 Contributors to the Eclipse Foundation.
  * Copyright (c) 2008, 2020 Oracle and/or its affiliates. All rights reserved.
  *
  * This program and the accompanying materials are made available under the
@@ -57,6 +57,7 @@ import org.glassfish.grizzly.StandaloneProcessor;
 import org.glassfish.grizzly.StandaloneProcessorSelector;
 import org.glassfish.grizzly.Transport;
 import org.glassfish.grizzly.WriteResult;
+import org.glassfish.grizzly.asyncqueue.AsyncQueueWriter;
 import org.glassfish.grizzly.asyncqueue.AsyncReadQueueRecord;
 import org.glassfish.grizzly.asyncqueue.AsyncWriteQueueRecord;
 import org.glassfish.grizzly.asyncqueue.TaskQueue;
@@ -84,12 +85,22 @@ public abstract class NIOConnection implements Connection<SocketAddress> {
     private static final Logger LOGGER = Grizzly.logger(NIOConnection.class);
     private static final short MAX_ZERO_READ_COUNT = 100;
 
+    private static final long DEFAULT_PENDING_BYTES_HARD_LIMIT;
+
+    static {
+        final long maxHeapBytes = Runtime.getRuntime().maxMemory();
+        final long budgetBytesTotal = (long) (maxHeapBytes * 0.25);
+        final int minConcurrentConnection = 100;
+        DEFAULT_PENDING_BYTES_HARD_LIMIT = budgetBytesTotal / minConcurrentConnection;
+    }
+
     private final long id = CONNECTION_ID_GENERATOR.incrementAndGet();
     /** Is initial OP_READ enabling required for the connection */
     private boolean isInitialReadRequired = true;
 
     protected final NIOTransport transport;
     protected volatile int maxAsyncWriteQueueSize;
+    protected volatile int asyncWriteQueueSizeHardLimitMultiplier;
     protected volatile long readTimeoutMillis = 30_000L;
     protected volatile long writeTimeoutMillis = 30_000L;
     protected volatile SelectableChannel channel;
@@ -203,6 +214,22 @@ public abstract class NIOConnection implements Connection<SocketAddress> {
     @Override
     public void setMaxAsyncWriteQueueSize(int maxAsyncWriteQueueSize) {
         this.maxAsyncWriteQueueSize = maxAsyncWriteQueueSize;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public int getAsyncWriteQueueSizeHardLimitMultiplier() {
+        return asyncWriteQueueSizeHardLimitMultiplier;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public void setAsyncWriteQueueSizeHardLimitMultiplier(int asyncWriteQueueSizeHardLimitMultiplier) {
+        this.asyncWriteQueueSizeHardLimitMultiplier = asyncWriteQueueSizeHardLimitMultiplier;
     }
 
     @Override
@@ -1056,5 +1083,32 @@ public abstract class NIOConnection implements Connection<SocketAddress> {
                 return state;
             }
         }
+    }
+
+    protected void resetProperties() {
+        setReadBufferSize(transport.getReadBufferSize());
+        setWriteBufferSize(transport.getWriteBufferSize());
+
+        final int transportMaxAsyncWriteQueueSize =
+                transport.getAsyncQueueIO().getWriter().getMaxPendingBytesPerConnection();
+        setMaxAsyncWriteQueueSize(
+                transportMaxAsyncWriteQueueSize == AsyncQueueWriter.AUTO_SIZE ? getWriteBufferSize() * 4 :
+                transportMaxAsyncWriteQueueSize);
+
+        final int transportHardLimitMultiplier =
+                transport.getAsyncQueueIO().getWriter().getPendingBytesHardLimitMultiplier();
+        setAsyncWriteQueueSizeHardLimitMultiplier(transportHardLimitMultiplier == AsyncQueueWriter.AUTO_SIZE ?
+                                                  calculateHardLimitMultiplier(maxAsyncWriteQueueSize) :
+                                                  transportHardLimitMultiplier);
+    }
+
+    protected static int calculateHardLimitMultiplier(final int maxAsyncWriteQueueSize) {
+        if (maxAsyncWriteQueueSize <= 0) {
+            return AsyncQueueWriter.MIN_PENDING_BYTES_HARD_LIMIT_MULTIPLIER;
+        }
+        final int multiplier = (int) Math.max(Integer.MIN_VALUE,
+                                              Math.min(DEFAULT_PENDING_BYTES_HARD_LIMIT / maxAsyncWriteQueueSize,
+                                                       Integer.MAX_VALUE));
+        return Math.max(multiplier, AsyncQueueWriter.MIN_PENDING_BYTES_HARD_LIMIT_MULTIPLIER);
     }
 }

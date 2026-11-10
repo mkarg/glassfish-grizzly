@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2026 Contributors to the Eclipse Foundation.
  * Copyright (c) 2011, 2025 Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2018 Payara Services Ltd.
  *
@@ -64,6 +65,7 @@ public abstract class NIOTransportBuilder<T extends NIOTransportBuilder> {
     protected boolean reuseAddress = NIOTransport.DEFAULT_REUSE_ADDRESS;
     protected boolean reusePort = NIOTransport.DEFAULT_REUSE_PORT;
     protected int maxPendingBytesPerConnection = AsyncQueueWriter.AUTO_SIZE;
+    protected int pendingBytesHardLimitMultiplierPerConnection = AsyncQueueWriter.AUTO_SIZE;
     protected boolean optimizedForMultiplexing = NIOTransport.DEFAULT_OPTIMIZED_FOR_MULTIPLEXING;
 
     protected long readTimeout = TimeUnit.MILLISECONDS.convert(Transport.DEFAULT_READ_TIMEOUT, TimeUnit.SECONDS);
@@ -548,6 +550,40 @@ public abstract class NIOTransportBuilder<T extends NIOTransportBuilder> {
     }
 
     /**
+     * Gets the multiplier used to calculate the hard limit for the asynchronous
+     * write queue reservation size per connection.
+     *
+     * <p>The hard limit is calculated by multiplying the connection's soft limit
+     * by this value.</p>
+     *
+     * @return the configured hard limit multiplier
+     * @see AsyncQueueWriter#getPendingBytesHardLimitMultiplier()
+     */
+    public int getAsyncWriteQueueSizeHardLimitMultiplier() {
+        return pendingBytesHardLimitMultiplierPerConnection;
+    }
+
+    /**
+     * Sets the multiplier used to calculate the hard limit for the asynchronous
+     * write queue reservation size per connection.
+     *
+     * <p>The hard limit is calculated by multiplying the connection's soft limit
+     * by this value.
+     * A value less than or equal to zero enables automatic configuration,
+     * which calculates the multiplier from the maximum amount of memory
+     * and the maximum asynchronous write queue size.</p>
+     *
+     * @param asyncWriteQueueSizeHardLimitMultiplier the hard limit multiplier,
+     *                                               or a non-positive value to enable automatic configuration
+     * @return this builder
+     * @see AsyncQueueWriter#setPendingBytesHardLimitMultiplier(int)
+     */
+    public T setAsyncWriteQueueSizeHardLimitMultiplier(final int asyncWriteQueueSizeHardLimitMultiplier) {
+        this.pendingBytesHardLimitMultiplierPerConnection = asyncWriteQueueSizeHardLimitMultiplier;
+        return getThis();
+    }
+
+    /**
      * @return true, if NIOTransport is configured to use AsyncQueueWriter, optimized to be used in connection multiplexing
      * mode, or false otherwise.
      * @see org.glassfish.grizzly.nio.NIOTransport#isOptimizedForMultiplexing()
@@ -598,6 +634,7 @@ public abstract class NIOTransportBuilder<T extends NIOTransportBuilder> {
         transport.setReusePort(reusePort);
         transport.setOptimizedForMultiplexing(isOptimizedForMultiplexing());
         transport.getAsyncQueueIO().getWriter().setMaxPendingBytesPerConnection(maxPendingBytesPerConnection);
+        transport.getAsyncQueueIO().getWriter().setPendingBytesHardLimitMultiplier(pendingBytesHardLimitMultiplierPerConnection);
         return transport;
     }
 

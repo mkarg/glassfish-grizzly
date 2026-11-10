@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2026 Contributors to the Eclipse Foundation.
  * Copyright (c) 2009, 2020 Oracle and/or its affiliates. All rights reserved.
  *
  * This program and the accompanying materials are made available under the
@@ -17,6 +18,8 @@
 package org.glassfish.grizzly;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -27,11 +30,15 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -71,8 +78,6 @@ import org.junit.runners.Parameterized.Parameters;
 @SuppressWarnings("unchecked")
 @RunWith(Parameterized.class)
 public class AsyncWriteQueueTest {
-    public static final int PORT = 7781;
-
     private static final Logger LOGGER = Grizzly.logger(AsyncWriteQueueTest.class);
 
     @Parameters
@@ -93,6 +98,7 @@ public class AsyncWriteQueueTest {
 
     @Test
     public void testParallelWrites() throws Exception {
+        final int port = TestUtils.findAvailableTcpPort();
         Connection connection = null;
 
         final AtomicInteger serverRcvdMessages = new AtomicInteger();
@@ -114,7 +120,7 @@ public class AsyncWriteQueueTest {
         transport.setProcessor(filterChainBuilder.build());
 
         try {
-            transport.bind(PORT);
+            transport.bind(port);
             transport.start();
 
             FilterChain clientFilterChain = FilterChainBuilder.stateless().add(new TransportFilter()).add(new StringFilter(Charsets.UTF8_CHARSET))
@@ -129,12 +135,14 @@ public class AsyncWriteQueueTest {
 
             SocketConnectorHandler connectorHandler = TCPNIOConnectorHandler.builder(transport).processor(clientFilterChain).build();
 
-            Future<Connection> future = connectorHandler.connect("localhost", PORT);
+            Future<Connection> future = connectorHandler.connect("localhost", port);
             connection = future.get(10, TimeUnit.SECONDS);
             assertTrue(connection != null);
 
             final AsyncQueueWriter asyncQueueWriter = transport.getAsyncQueueIO().getWriter();
             asyncQueueWriter.setMaxPendingBytesPerConnection(256);
+            // A sufficiently large value that does not hit the hard limit.
+            asyncQueueWriter.setPendingBytesHardLimitMultiplier(1000);
 
             final Connection finalConnection = connection;
 
@@ -191,8 +199,11 @@ public class AsyncWriteQueueTest {
                 for (int i = 0; i < futures.size(); i++) {
                     try {
                         assertTrue(Boolean.TRUE.equals(futures.get(i).get(10, TimeUnit.SECONDS)));
-                    } catch (Exception e) {
+                    } catch (TimeoutException e) {
                         fail("Timeout on thread#" + i);
+                        throw e;
+                    } catch (Throwable e) {
+                        fail("Exception on thread#" + i + ": " + e.getMessage());
                         throw e;
                     }
                 }
@@ -210,6 +221,7 @@ public class AsyncWriteQueueTest {
 
     @Test
     public void testAsyncWriteQueueEcho() throws Exception {
+        final int port = TestUtils.findAvailableTcpPort();
         Connection connection = null;
         StreamReader reader;
 
@@ -236,10 +248,10 @@ public class AsyncWriteQueueTest {
             final AsyncQueueWriter<SocketAddress> asyncQueueWriter = transport.getAsyncQueueIO().getWriter();
             asyncQueueWriter.setMaxPendingBytesPerConnection(-1);
 
-            transport.bind(PORT);
+            transport.bind(port);
             transport.start();
 
-            Future<Connection> future = transport.connect("localhost", PORT);
+            Future<Connection> future = transport.connect("localhost", port);
             connection = future.get(10, TimeUnit.SECONDS);
             assertTrue(connection != null);
 
@@ -335,7 +347,7 @@ public class AsyncWriteQueueTest {
 
     @Test
     public void testQueueNotification() throws Exception {
-
+        final int port = TestUtils.findAvailableTcpPort();
         Connection connection = null;
         final int packetSize = 256000;
 
@@ -350,10 +362,10 @@ public class AsyncWriteQueueTest {
             asyncQueueWriter.setMaxPendingBytesPerConnection(256000 * 10);
             System.out.println("Max Space: " + asyncQueueWriter.getMaxPendingBytesPerConnection());
 
-            transport.bind(PORT);
+            transport.bind(port);
             transport.start();
 
-            Future<Connection> future = transport.connect("localhost", PORT);
+            Future<Connection> future = transport.connect("localhost", port);
             connection = future.get(10, TimeUnit.SECONDS);
             assertTrue(connection != null);
             connection.configureStandalone(true);
@@ -408,6 +420,7 @@ public class AsyncWriteQueueTest {
 
     @Test
     public void testAsyncWriteQueueReentrants() throws Exception {
+        final int port = TestUtils.findAvailableTcpPort();
         Connection connection = null;
 
         final AtomicInteger serverRcvdBytes = new AtomicInteger();
@@ -428,10 +441,10 @@ public class AsyncWriteQueueTest {
         transport.setProcessor(filterChainBuilder.build());
 
         try {
-            transport.bind(PORT);
+            transport.bind(port);
             transport.start();
 
-            Future<Connection> future = transport.connect("localhost", PORT);
+            Future<Connection> future = transport.connect("localhost", port);
             connection = future.get(10, TimeUnit.SECONDS);
             assertTrue(connection != null);
 
@@ -509,6 +522,241 @@ public class AsyncWriteQueueTest {
                 connection.closeSilently();
             }
 
+            transport.shutdownNow();
+        }
+    }
+
+    /**
+     * A writer that respects canWrite() must not run into the hard limit, even if a single record is larger than it.
+     * Only a writer that keeps adding to a full queue is stopped.
+     */
+    @SuppressWarnings({"rawtypes", "deprecation"})
+    @Test
+    public void testSingleWriteLargerThanHardLimitIsAccepted() throws Exception {
+        final int port = TestUtils.findAvailableTcpPort();
+        Connection connection = null;
+        final int packetSize = 256000;
+
+        final FilterChainBuilder filterChainBuilder = FilterChainBuilder.stateless();
+        filterChainBuilder.add(new TransportFilter());
+        final TCPNIOTransport transport = createTransport(isOptimizedForMultiplexing);
+        transport.setProcessor(filterChainBuilder.build());
+
+        try {
+            final AsyncQueueWriter<SocketAddress> asyncQueueWriter = transport.getAsyncQueueIO().getWriter();
+            asyncQueueWriter.setMaxPendingBytesPerConnection(packetSize);
+            asyncQueueWriter.setPendingBytesHardLimitMultiplier(4);
+            final long hardLimit = (long) asyncQueueWriter.getMaxPendingBytesPerConnection() * asyncQueueWriter.getPendingBytesHardLimitMultiplier();
+
+            transport.bind(port);
+            transport.start();
+
+            final Future<Connection> future = transport.connect("localhost", port);
+            connection = future.get(10, TimeUnit.SECONDS);
+            assertNotNull(connection);
+            connection.configureStandalone(true);
+
+            transport.pause();
+
+            final MemoryManager mm = transport.getMemoryManager();
+            final TaskQueue tqueue = ((NIOConnection) connection).getAsyncWriteQueue();
+
+            // one record far larger than the hard limit (and the socket buffers), written while the queue accepts data
+            assertTrue(asyncQueueWriter.canWrite(connection));
+            final byte[] large = new byte[(int) hardLimit * 16];
+            Arrays.fill(large, (byte) 1);
+            asyncQueueWriter.write(connection, Buffers.wrap(mm, large));
+            assertTrue(connection.isOpen());
+            assertTrue(tqueue.spaceInBytes() >= asyncQueueWriter.getMaxPendingBytesPerConnection());
+            assertFalse(asyncQueueWriter.canWrite(connection));
+
+            // writing on although canWrite() is false still hits the hard limit
+            final byte[] more = new byte[packetSize];
+            Arrays.fill(more, (byte) 1);
+            final FutureImpl<Boolean> f = SafeFutureImpl.create();
+            asyncQueueWriter.write(connection, Buffers.wrap(mm, more), new EmptyCompletionHandler<>() {
+
+                @Override
+                public void completed(WriteResult result) {
+                    f.result(Boolean.TRUE);
+                }
+
+                @Override
+                public void failed(Throwable throwable) {
+                    f.failure(throwable);
+                }
+            });
+            try {
+                f.get(10, TimeUnit.SECONDS);
+                fail();
+            } catch (InterruptedException | TimeoutException e) {
+                fail();
+            } catch (ExecutionException e) {
+                // expected
+            }
+            assertFalse(connection.isOpen());
+
+            transport.resume();
+        } finally {
+            if (connection != null) {
+                connection.closeSilently();
+            }
+            if (transport.isPaused()) {
+                transport.resume();
+            }
+            transport.shutdownNow();
+        }
+    }
+
+    @SuppressWarnings({"rawtypes", "deprecation"})
+    @Test
+    public void testPendingBytesHardLimit() throws Exception {
+        final int port = TestUtils.findAvailableTcpPort();
+        Connection connection = null;
+        final int packetSize = 256000;
+
+        final FilterChainBuilder filterChainBuilder = FilterChainBuilder.stateless();
+        filterChainBuilder.add(new TransportFilter());
+        final TCPNIOTransport transport = createTransport(isOptimizedForMultiplexing);
+        transport.setProcessor(filterChainBuilder.build());
+
+        try {
+            final AsyncQueueWriter<SocketAddress> asyncQueueWriter = transport.getAsyncQueueIO().getWriter();
+            asyncQueueWriter.setMaxPendingBytesPerConnection(packetSize * 10);
+            asyncQueueWriter.setPendingBytesHardLimitMultiplier(4);
+            final int softLimit = asyncQueueWriter.getMaxPendingBytesPerConnection();
+            final long hardLimit = (long) softLimit * asyncQueueWriter.getPendingBytesHardLimitMultiplier();
+            System.out.println("Soft limit Space: " + softLimit);
+            System.out.println("Hard limit Space: " + hardLimit);
+
+            transport.bind(port);
+            transport.start();
+
+            final Future<Connection> future = transport.connect("localhost", port);
+            connection = future.get(10, TimeUnit.SECONDS);
+            assertNotNull(connection);
+            connection.configureStandalone(true);
+
+            transport.pause();
+
+            final MemoryManager mm = transport.getMemoryManager();
+            final TaskQueue tqueue = ((NIOConnection) connection).getAsyncWriteQueue();
+            while (asyncQueueWriter.canWrite(connection)) {
+                final byte[] originalMessage = new byte[packetSize];
+                Arrays.fill(originalMessage, (byte) 1);
+                final Buffer buffer = Buffers.wrap(mm, originalMessage);
+                try {
+                    asyncQueueWriter.write(connection, buffer);
+                } catch (IOException e) {
+                    fail("IOException occurred: " + e);
+                }
+            }
+            // The final write will likely have already exceeded the soft limit.
+            assertTrue(tqueue.spaceInBytes() >= softLimit);
+            assertTrue(connection.isOpen());
+
+            // attempts to write right up to the point of reaching the hard limit for space.
+            while (tqueue.spaceInBytes() + packetSize <= hardLimit) {
+                final byte[] originalMessage = new byte[packetSize];
+                Arrays.fill(originalMessage, (byte) 1);
+                final Buffer buffer = Buffers.wrap(mm, originalMessage);
+                assertFalse(asyncQueueWriter.canWrite(connection));
+                try {
+                    asyncQueueWriter.write(connection, buffer);
+                } catch (IOException e) {
+                    fail("IOException occurred: " + e);
+                }
+            }
+            assertTrue(connection.isOpen());
+
+            // writes beyond the hard limit for space.
+            final byte[] originalMessage = new byte[packetSize];
+            Arrays.fill(originalMessage, (byte) 1);
+            final Buffer buffer = Buffers.wrap(mm, originalMessage);
+            final FutureImpl<Boolean> f = SafeFutureImpl.create();
+            asyncQueueWriter.write(connection, buffer, new EmptyCompletionHandler<>() {
+
+                @Override
+                public void completed(WriteResult result) {
+                    f.result(Boolean.TRUE);
+                }
+
+                @Override
+                public void failed(Throwable throwable) {
+                    f.failure(throwable);
+                }
+            });
+            try {
+                f.get(10, TimeUnit.SECONDS);
+                fail();
+            } catch (InterruptedException | TimeoutException e) {
+                fail();
+            } catch (ExecutionException e) {
+                System.out.println(e.getCause().toString());
+            }
+            // The connection should be closed when attempting a write operation that exceeds the hard limit for space.
+            assertFalse(connection.isOpen());
+            // the space must be maintained so as not to exceed the hard limit.
+            assertTrue(tqueue.spaceInBytes() <= hardLimit);
+            System.out.println("Queue Space: " + tqueue.spaceInBytes());
+
+            transport.resume();
+        } finally {
+            if (connection != null) {
+                connection.closeSilently();
+            }
+            if (transport.isPaused()) {
+                transport.resume();
+            }
+            transport.shutdownNow();
+        }
+    }
+
+    @Test
+    public void testNotifyCanWriteOnClosingConnection() throws Exception {
+        final int port = TestUtils.findAvailableTcpPort();
+        Connection<SocketAddress> connection = null;
+        FilterChainBuilder filterChainBuilder = FilterChainBuilder.stateless();
+        filterChainBuilder.add(new TransportFilter());
+        final TCPNIOTransport transport = createTransport(isOptimizedForMultiplexing);
+        transport.setProcessor(filterChainBuilder.build());
+        try {
+            final AsyncQueueWriter<SocketAddress> asyncQueueWriter = transport.getAsyncQueueIO().getWriter();
+            transport.bind(port);
+            transport.start();
+            connection = transport.connect("localhost", port).get(10, TimeUnit.SECONDS);
+            assertNotNull(connection);
+
+            var canWriteDuringClose = new AtomicBoolean(true);
+            var writePossibleCount = new AtomicInteger();
+            var error = new AtomicReference<>();
+            var closingConnection = connection;
+            closingConnection.addCloseListener(
+                    (org.glassfish.grizzly.CloseListener<Connection<SocketAddress>, ?>) (closeable, type) -> {
+                        canWriteDuringClose.set(asyncQueueWriter.canWrite(closingConnection));
+                        asyncQueueWriter.notifyWritePossible(closingConnection, new WriteHandler() {
+                            @Override
+                            public void onWritePossible() {
+                                writePossibleCount.incrementAndGet();
+                            }
+
+                            @Override
+                            public void onError(Throwable throwable) {
+                                error.set(throwable);
+                            }
+                        });
+                    });
+            closingConnection.close().get(3, TimeUnit.SECONDS);
+
+            assertFalse(closingConnection.isOpen());
+            assertFalse(closingConnection.canWrite());
+            assertFalse(canWriteDuringClose.get());
+            assertEquals(0, writePossibleCount.get());
+            assertTrue(error.get() instanceof IOException);
+        } finally {
+            if (connection != null && connection.isOpen()) {
+                connection.closeSilently();
+            }
             transport.shutdownNow();
         }
     }

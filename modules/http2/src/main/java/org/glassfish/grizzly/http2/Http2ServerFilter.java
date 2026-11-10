@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025 Contributors to the Eclipse Foundation.
+ * Copyright (c) 2025, 2026 Contributors to the Eclipse Foundation.
  * Copyright (c) 2015, 2020 Oracle and/or its affiliates and others.
  * All rights reserved.
  * Copyright (c) 2021 Contributors to the Eclipse Foundation
@@ -44,6 +44,7 @@ import javax.net.ssl.SSLEngine;
 import org.glassfish.grizzly.Buffer;
 import org.glassfish.grizzly.Connection;
 import org.glassfish.grizzly.Grizzly;
+import org.glassfish.grizzly.ThreadCache;
 import org.glassfish.grizzly.Transport;
 import org.glassfish.grizzly.attributes.Attribute;
 import org.glassfish.grizzly.attributes.AttributeBuilder;
@@ -533,6 +534,12 @@ public class Http2ServerFilter extends Http2BaseFilter {
             Http2State.remove(connection);
             return false;
         }
+        // the HTTP/1.1 request becomes the request of stream 1, which may still use it after Request#recycle() reset it:
+        // keep it in the recycling thread's cache, as before #2386, instead of handing it back to the thread that created
+        // it, which could give it to another connection at once
+        if (httpRequest instanceof ThreadCache.OwnerAware) {
+            ((ThreadCache.OwnerAware) httpRequest).keepInRecyclingThreadCache();
+        }
         // create a virtual stream for this request
         final Http2Stream stream = http2Session.acceptUpgradeStream(httpRequest, 0, !httpRequest.isExpectContent());
 
@@ -627,7 +634,13 @@ public class Http2ServerFilter extends Http2BaseFilter {
             return;
         }
 
-        stream = http2Session.acceptStream(request, headersFrame.getStreamId(), headersFrame.getStreamDependency(), headersFrame.isExclusive(), 0);
+        try {
+            stream = http2Session.acceptStream(request, headersFrame.getStreamId(), headersFrame.getStreamDependency(), headersFrame.isExclusive(), 0);
+        } catch (Http2StreamException e) {
+            request.recycle();
+            DecoderUtils.skipHeaders(http2Session);
+            throw e;
+        }
         if (stream == null) { // GOAWAY has been sent, so ignoring this request
             request.recycle();
             return;
